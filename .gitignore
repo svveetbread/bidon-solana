@@ -1,0 +1,9 @@
+﻿# bidon-solana
+target/
+.anchor/
+test-ledger/
+node_modules/
+.env
+.env.*
+*.local
+dist/
