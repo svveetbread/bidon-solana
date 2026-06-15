@@ -14,7 +14,7 @@ embedded-кошелёк (cheap-first **Web3Auth-Solana**). Авто-раздач
 - program id (devnet placeholder): `9GSQvMe9CUV217nSVfhBc3VhoQe5RAGS5VGhuBPDsWMW`
 - PDA: `config = ["config"]`, `auction = ["auction", id_le8]`, `vault = ["vault", auction_pubkey]` (PDA-токен-аккаунт, authority = auction),
   `proposal = ["proposal", auction_pubkey, pid_le8]`, `bid = ["bid", auction_pubkey, pid_le8, bidder]`.
-- **Готово (20 LiteSVM-тестов зелёные):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
+- **Готово (24 LiteSVM-теста зелёные; вкл. 1.6 негативные валидации):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
   (owner-only, `has_one`) · `create_auction(id, min_bid, duration_secs)` (id == `config.auction_count`, инкремент; **создаёт vault**) ·
   `place_bid(proposal_id, content_hash[32], amount)` (НОВОЕ предложение: `pid == auction.proposal_count`, `transfer_checked` USDC→vault) ·
   `raise_bid(proposal_id, amount)` (на СУЩЕСТВУЮЩЕЕ: `init_if_needed` Bid — новый бэкер создаёт, повторный накапливает; обновляет лидера) ·
