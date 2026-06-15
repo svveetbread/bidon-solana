@@ -14,17 +14,19 @@ embedded-кошелёк (cheap-first **Web3Auth-Solana**). Авто-раздач
 - program id (devnet placeholder): `9GSQvMe9CUV217nSVfhBc3VhoQe5RAGS5VGhuBPDsWMW`
 - PDA: `config = ["config"]`, `auction = ["auction", id_le8]`, `vault = ["vault", auction_pubkey]` (PDA-токен-аккаунт, authority = auction),
   `proposal = ["proposal", auction_pubkey, pid_le8]`, `bid = ["bid", auction_pubkey, pid_le8, bidder]`.
-- **Готово (12 LiteSVM-тестов зелёные):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
+- **Готово (16 LiteSVM-тестов зелёные):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
   (owner-only, `has_one`) · `create_auction(id, min_bid, duration_secs)` (id == `config.auction_count`, инкремент; **создаёт vault**) ·
-  `place_bid(proposal_id, content_hash[32], amount)` (новое предложение: `pid == auction.proposal_count`, `transfer_checked` USDC→vault,
-  гейты end_time/min_bid/mint; инвариант `vault == Σ ставок`).
+  `place_bid(proposal_id, content_hash[32], amount)` (НОВОЕ предложение: `pid == auction.proposal_count`, `transfer_checked` USDC→vault) ·
+  `raise_bid(proposal_id, amount)` (на СУЩЕСТВУЮЩЕЕ: `init_if_needed` Bid — новый бэкер создаёт, повторный накапливает; обновляет лидера).
+  Гейты: до end_time, `>= min_bid`, mint == config.usdc_mint. Инвариант `vault == Σ ставок`, лидер инкрементальный (без перебора).
 - State: `Config{owner, fee_bps, fee_receiver, usdc_mint, auction_count, bump}` ·
-  `Auction{id, creator, min_bid, fee_bps, end_time, finalized, creator_paid, total_staked, proposal_count, bump}` ·
+  `Auction{id, creator, min_bid, fee_bps, end_time, finalized, creator_paid, total_staked, proposal_count, winner_proposal, winner_amount, bump}` ·
   `Proposal{auction, id, creator, content_hash, total_amount, bump}` · `Bid{auction, proposal, bidder, amount, returned, bump}`.
-- **Дальше по PLAN.md:** 1.5 `place_bid` на существующее предложение (добор/перебой, отдельная инструкция) → `finalize` →
+- **Дальше по PLAN.md:** 1.6 негативные валидации `place_bid`/`raise_bid` → `finalize` (winner = `auction.winner_proposal`) →
   `claim_winnings` (creator) → `withdraw` (loser). Инвариант: `vault == Σ невозвращённых ставок`.
 - **Грабли Anchor 1.0:** `CpiContext::new(program_id: Pubkey, accounts)` (раньше брал `AccountInfo`); `init` НЕ требует `rent`-аккаунт
-  (через `Rent::get()`); `litesvm-token` тянет `litesvm 0.12` (dev-dep подняли с 0.10).
+  (через `Rent::get()`); `litesvm-token` тянет `litesvm 0.12` (dev-dep подняли с 0.10); инструкции с многими аккаунтами + CPI
+  упираются в стек BPF (4КБ/кадр) → тяжёлые `Account<T>` в **`Box`** (особенно при `init-if-needed`).
 
 ## Реюз готового фронта (взять фронт, сменить бэкенд)
 Источник: **`D:\bidon-base\frontend`** (React + Vite + TS, тесты vitest). Скопировать в `D:\bidon-solana\frontend`, затем:
