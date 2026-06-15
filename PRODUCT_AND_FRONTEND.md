@@ -14,18 +14,19 @@ embedded-кошелёк (cheap-first **Web3Auth-Solana**). Авто-раздач
 - program id (devnet placeholder): `9GSQvMe9CUV217nSVfhBc3VhoQe5RAGS5VGhuBPDsWMW`
 - PDA: `config = ["config"]`, `auction = ["auction", id_le8]`, `vault = ["vault", auction_pubkey]` (PDA-токен-аккаунт, authority = auction),
   `proposal = ["proposal", auction_pubkey, pid_le8]`, `bid = ["bid", auction_pubkey, pid_le8, bidder]`.
-- **Готово (28 LiteSVM-тестов зелёные; вкл. 1.6 негативы):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
+- **Готово (32 LiteSVM-теста зелёные; ядро функционально полное — 8 инструкций):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
   (owner-only, `has_one`) · `create_auction(id, min_bid, duration_secs)` (id == `config.auction_count`, инкремент; **создаёт vault**) ·
   `place_bid(proposal_id, content_hash[32], amount)` (НОВОЕ предложение: `pid == auction.proposal_count`, `transfer_checked` USDC→vault) ·
   `raise_bid(proposal_id, amount)` (на СУЩЕСТВУЮЩЕЕ: `init_if_needed` Bid — новый бэкер создаёт, повторный накапливает; обновляет лидера) ·
   `finalize()` (permissionless после end_time, помечает `finalized`; победитель уже в `winner_proposal`; идемпотентно; деньги НЕ двигает) ·
-  `claim_winnings()` (permissionless/keeper после finalize: creator получает `winner_amount − fee`, комиссия → fee_receiver; PDA-подпись vault; только раз).
+  `claim_winnings()` (permissionless/keeper после finalize: creator получает `winner_amount − fee`, комиссия → fee_receiver; PDA-подпись vault; только раз) ·
+  `withdraw(proposal_id, bidder)` (permissionless/keeper после finalize: проигравший забирает свою ставку; победившие — нет; PDA-подпись vault; только раз).
   Гейты ставок: до end_time, `>= min_bid`, mint == config.usdc_mint. Инвариант `vault == Σ ставок`, лидер инкрементальный (без перебора).
 - State: `Config{owner, fee_bps, fee_receiver, usdc_mint, auction_count, bump}` ·
   `Auction{id, creator, min_bid, fee_bps, end_time, finalized, creator_paid, total_staked, proposal_count, winner_proposal, winner_amount, bump}` ·
   `Proposal{auction, id, creator, content_hash, total_amount, bump}` · `Bid{auction, proposal, bidder, amount, returned, bump}`.
-- **Дальше по PLAN.md:** `withdraw` (loser забирает свою ставку; победившие — нет) → 1.10 сводные инварианты
-  (`Σin==Σout`, `vault == Σ невозвращённых`). Раздача — **pull** + keeper (permissionless-фолбэк).
+- **Дальше по PLAN.md:** 1.10 сводный e2e-инвариант (`Σin==Σout`, `vault → 0`) → 1.11 общий зелёный → **Phase 2 (фронт под Solana)**.
+  Раздача — **pull** + keeper (permissionless-фолбэк). Закрытие аккаунтов с возвратом rent — опционально (на потом).
 - **Грабли Anchor 1.0:** `CpiContext::new(program_id: Pubkey, accounts)` (раньше брал `AccountInfo`); `init` НЕ требует `rent`-аккаунт
   (через `Rent::get()`); `litesvm-token` тянет `litesvm 0.12` (dev-dep подняли с 0.10); инструкции с многими аккаунтами + CPI
   упираются в стек BPF (4КБ/кадр) → тяжёлые `Account<T>` в **`Box`** (особенно при `init-if-needed`).
