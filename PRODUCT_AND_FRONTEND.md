@@ -14,7 +14,7 @@ embedded-кошелёк (cheap-first **Web3Auth-Solana**). Авто-раздач
 - program id (devnet placeholder): `9GSQvMe9CUV217nSVfhBc3VhoQe5RAGS5VGhuBPDsWMW`
 - PDA: `config = ["config"]`, `auction = ["auction", id_le8]`, `vault = ["vault", auction_pubkey]` (PDA-токен-аккаунт, authority = auction),
   `proposal = ["proposal", auction_pubkey, pid_le8]`, `bid = ["bid", auction_pubkey, pid_le8, bidder]`.
-- **✅ Phase 1 ГОТОВА (33 LiteSVM-теста зелёные, без warnings; 8 инструкций):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
+- **✅ Phase 1 ГОТОВА + газлесс Этап 1 (36 LiteSVM-тестов зелёные, без warnings; 8 инструкций):** `initialize(fee_bps, fee_receiver, usdc_mint)` · `set_config(fee_bps, fee_receiver)`
   (owner-only, `has_one`) · `create_auction(id, min_bid, duration_secs)` (id == `config.auction_count`, инкремент; **создаёт vault**) ·
   `place_bid(proposal_id, content_hash[32], amount)` (НОВОЕ предложение: `pid == auction.proposal_count`, `transfer_checked` USDC→vault) ·
   `raise_bid(proposal_id, amount)` (на СУЩЕСТВУЮЩЕЕ: `init_if_needed` Bid — новый бэкер создаёт, повторный накапливает; обновляет лидера) ·
@@ -22,11 +22,13 @@ embedded-кошелёк (cheap-first **Web3Auth-Solana**). Авто-раздач
   `claim_winnings()` (permissionless/keeper после finalize: creator получает `winner_amount − fee`, комиссия → fee_receiver; PDA-подпись vault; только раз) ·
   `withdraw(proposal_id, bidder)` (permissionless/keeper после finalize: проигравший забирает свою ставку; победившие — нет; PDA-подпись vault; только раз).
   Гейты ставок: до end_time, `>= min_bid`, mint == config.usdc_mint. Инвариант `vault == Σ ставок`, лидер инкрементальный (без перебора).
+- **🪙 Газлесс:** `create_auction`/`place_bid`/`raise_bid` принимают отдельный **`payer: Signer`** (relayer платит rent+tx-fee);
+  юзер (creator/bidder) с **0 SOL** только подписывает как authority. `rent_payer` хранится в аккаунте → возврат relayer'у при закрытии. **Ставку 0.1 USDC юзер делает без SOL.**
 - State: `Config{owner, fee_bps, fee_receiver, usdc_mint, auction_count, bump}` ·
-  `Auction{id, creator, min_bid, fee_bps, end_time, finalized, creator_paid, total_staked, proposal_count, winner_proposal, winner_amount, bump}` ·
-  `Proposal{auction, id, creator, content_hash, total_amount, bump}` · `Bid{auction, proposal, bidder, amount, returned, bump}`.
-- **Дальше:** де-риск-спайки 0.3–0.5 (Web3Auth-Solana/газлесс/Helius) · security-проход программы · devnet-деплой+e2e · **Phase 2 фронт**.
-  Раздача — **pull** + keeper (permissionless-фолбэк). Закрытие аккаунтов с возвратом rent — опционально (на потом).
+  `Auction{…, winner_proposal, winner_amount, rent_payer, bump}` · `Proposal{auction, id, creator, content_hash, total_amount, rent_payer, bump}` ·
+  `Bid{auction, proposal, bidder, amount, returned, rent_payer, bump}`.
+- **Дальше:** газлесс Этап 2 (закрытие аккаунтов → возврат rent relayer'у) · Kora relayer (Phase 2) · публичный devnet (ждёт SOL) · **Phase 2 фронт** (TS-клиент посеян в `e2e/`).
+  Раздача — **pull** + keeper (permissionless-фолбэк).
 - **Грабли Anchor 1.0:** `CpiContext::new(program_id: Pubkey, accounts)` (раньше брал `AccountInfo`); `init` НЕ требует `rent`-аккаунт
   (через `Rent::get()`); `litesvm-token` тянет `litesvm 0.12` (dev-dep подняли с 0.10); инструкции с многими аккаунтами + CPI
   упираются в стек BPF (4КБ/кадр) → тяжёлые `Account<T>` в **`Box`** (особенно при `init-if-needed`).
