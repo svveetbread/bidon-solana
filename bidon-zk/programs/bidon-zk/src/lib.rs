@@ -146,6 +146,105 @@ pub mod bidon_zk {
 
         Ok(())
     }
+
+    /// Create a per-proposal compressed aggregate (running total + content hash).
+    /// In the full model this is created together with the first Bid inside place_bid;
+    /// kept standalone here to validate concurrency on the hot per-proposal account.
+    /// content_hash is the off-chain text hashed client-side (32 bytes, fixed size —
+    /// cost does not depend on text length).
+    pub fn create_proposal<'info>(
+        ctx: Context<'_, '_, '_, 'info, GenericAnchorAccounts<'info>>,
+        proof: ValidityProof,
+        address_tree_info: PackedAddressTreeInfo,
+        output_state_tree_index: u8,
+        proposal_id: u64,
+        content_hash: [u8; 32],
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, BidonError::InvalidAmount);
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.signer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+
+        let address_tree_pubkey = address_tree_info
+            .get_tree_pubkey(&light_cpi_accounts)
+            .map_err(|_| ErrorCode::AccountNotEnoughKeys)?;
+        if address_tree_pubkey.to_bytes() != ADDRESS_TREE_V2 {
+            msg!("Invalid address tree");
+            return Err(ProgramError::InvalidAccountData.into());
+        }
+
+        let proposal_le = proposal_id.to_le_bytes();
+        let (address, address_seed) = derive_address(
+            &[b"proposal", proposal_le.as_ref()],
+            &address_tree_pubkey,
+            &crate::ID,
+        );
+        let new_address_params =
+            address_tree_info.into_new_address_params_assigned_packed(address_seed, Some(0));
+
+        let mut proposal = LightAccount::<ProposalTotal>::new_init(
+            &crate::ID,
+            Some(address),
+            output_state_tree_index,
+        );
+        proposal.creator = ctx.accounts.signer.key();
+        proposal.content_hash = content_hash;
+        proposal.total = amount;
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(proposal)?
+            .with_new_addresses(&[new_address_params])
+            .invoke(light_cpi_accounts)?;
+
+        Ok(())
+    }
+
+    /// Add to a proposal's running total (every bid on this proposal updates it).
+    /// Concurrent adds to the SAME proposal contend: a validity proof is only valid
+    /// against the tree root it was fetched for. Once one add consumes the account
+    /// hash (nullifier model), a second add carrying the stale proof is rejected,
+    /// and the client must retry with a fresh proof. This is latency on a viral
+    /// proposal, not a cap.
+    pub fn add_to_proposal<'info>(
+        ctx: Context<'_, '_, '_, 'info, GenericAnchorAccounts<'info>>,
+        proof: ValidityProof,
+        account_meta: CompressedAccountMeta,
+        content_hash: [u8; 32],
+        creator: Pubkey,
+        current_total: u64,
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, BidonError::InvalidAmount);
+
+        let mut proposal = LightAccount::<ProposalTotal>::new_mut(
+            &crate::ID,
+            &account_meta,
+            ProposalTotal {
+                creator,
+                content_hash,
+                total: current_total,
+            },
+        )?;
+        proposal.total = proposal
+            .total
+            .checked_add(amount)
+            .ok_or(BidonError::Overflow)?;
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.signer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(proposal)?
+            .invoke(light_cpi_accounts)?;
+
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -170,4 +269,16 @@ pub struct Bid {
     pub bidder: Pubkey,
     pub proposal: u64,
     pub amount: u64,
+}
+
+// Hot per-proposal aggregate. content_hash anchors the off-chain text (32 bytes,
+// fixed regardless of text length); total is the running parimutuel sum.
+#[event]
+#[derive(Clone, Debug, Default, LightDiscriminator, LightHasher)]
+pub struct ProposalTotal {
+    #[hash]
+    pub creator: Pubkey,
+    #[hash]
+    pub content_hash: [u8; 32],
+    pub total: u64,
 }
