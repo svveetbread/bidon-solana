@@ -245,6 +245,78 @@ pub mod bidon_zk {
 
         Ok(())
     }
+
+    /// Open a NEW proposal together with its first bid in ONE transaction: creates
+    /// BOTH compressed accounts (ProposalTotal + Bid) under a SINGLE combined validity
+    /// proof. This is the core of the full place_bid (which will also transfer USDC to
+    /// the vault and bump the Auction leader). De-risks CU and tx size for two
+    /// compressed creates sharing one proof.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_first_bid<'info>(
+        ctx: Context<'_, '_, '_, 'info, GenericAnchorAccounts<'info>>,
+        proof: ValidityProof,
+        proposal_address_tree_info: PackedAddressTreeInfo,
+        bid_address_tree_info: PackedAddressTreeInfo,
+        output_state_tree_index: u8,
+        proposal_id: u64,
+        content_hash: [u8; 32],
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, BidonError::InvalidAmount);
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.signer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+
+        // Both addresses live in the same V2 address tree; validate once.
+        let address_tree_pubkey = proposal_address_tree_info
+            .get_tree_pubkey(&light_cpi_accounts)
+            .map_err(|_| ErrorCode::AccountNotEnoughKeys)?;
+        if address_tree_pubkey.to_bytes() != ADDRESS_TREE_V2 {
+            msg!("Invalid address tree");
+            return Err(ProgramError::InvalidAccountData.into());
+        }
+
+        let pid_le = proposal_id.to_le_bytes();
+        let (proposal_address, proposal_seed) =
+            derive_address(&[b"proposal", pid_le.as_ref()], &address_tree_pubkey, &crate::ID);
+        let (bid_address, bid_seed) = derive_address(
+            &[b"bid", pid_le.as_ref(), ctx.accounts.signer.key().as_ref()],
+            &address_tree_pubkey,
+            &crate::ID,
+        );
+
+        // Assign each new address to its LightAccount by index (0 = proposal, 1 = bid).
+        let proposal_params =
+            proposal_address_tree_info.into_new_address_params_assigned_packed(proposal_seed, Some(0));
+        let bid_params =
+            bid_address_tree_info.into_new_address_params_assigned_packed(bid_seed, Some(1));
+
+        let mut proposal = LightAccount::<ProposalTotal>::new_init(
+            &crate::ID,
+            Some(proposal_address),
+            output_state_tree_index,
+        );
+        proposal.creator = ctx.accounts.signer.key();
+        proposal.content_hash = content_hash;
+        proposal.total = amount;
+
+        let mut bid =
+            LightAccount::<Bid>::new_init(&crate::ID, Some(bid_address), output_state_tree_index);
+        bid.bidder = ctx.accounts.signer.key();
+        bid.proposal = proposal_id;
+        bid.amount = amount;
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(proposal)?
+            .with_light_account(bid)?
+            .with_new_addresses(&[proposal_params, bid_params])
+            .invoke(light_cpi_accounts)?;
+
+        Ok(())
+    }
 }
 
 #[error_code]
