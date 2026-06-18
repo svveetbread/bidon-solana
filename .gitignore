@@ -8,13 +8,15 @@ node_modules/
 *.local
 dist/
 
+# установленные сторонние агент-скилы (ZK Compression и пр.) — не в репо
+.agents/
+
 # ключ relayer для e2e (devnet-only, не в репо)
 .relayer.json
 
 # локальные скретч-скрипты и логи (не в репо)
 disc*.sh
 build.sh
-build.log
+*.log
 devnet-check.sh
 devnet-setup.sh
-mine.log
