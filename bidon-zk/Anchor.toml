@@ -5,7 +5,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-bidon_zk = "6mS4dhHdapQbfiAj9U8k6W9eJAshdA2SRjEi2tXuuAvx"
+bidon_zk = "4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz"
 
 [registry]
 url = "https://api.apr.dev"

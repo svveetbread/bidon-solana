@@ -16,10 +16,10 @@ use anchor_spl::token::{
     close_account, transfer_checked, CloseAccount, Mint, Token, TokenAccount, TransferChecked,
 };
 
-declare_id!("6mS4dhHdapQbfiAj9U8k6W9eJAshdA2SRjEi2tXuuAvx");
+declare_id!("4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz");
 
 pub const LIGHT_CPI_SIGNER: CpiSigner =
-    derive_light_cpi_signer!("6mS4dhHdapQbfiAj9U8k6W9eJAshdA2SRjEi2tXuuAvx");
+    derive_light_cpi_signer!("4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz");
 
 // ---- regular-account seeds & limits (Config / Auction / Vault) ----
 pub const CONFIG_SEED: &[u8] = b"config";
