@@ -7,7 +7,7 @@ use light_sdk::{
     address::v2::derive_address,
     cpi::{v2::CpiAccounts, CpiSigner},
     derive_light_cpi_signer,
-    instruction::{PackedAddressTreeInfo, ValidityProof},
+    instruction::{account_meta::CompressedAccountMeta, PackedAddressTreeInfo, ValidityProof},
     LightDiscriminator, LightHasher, PackedAddressTreeInfoExt,
 };
 use light_sdk::constants::ADDRESS_TREE_V2;
@@ -138,19 +138,13 @@ pub mod bidon_zk {
         let bidder_key = ctx.accounts.bidder.key();
 
         // 1. Pull USDC from the bidder into the auction vault.
-        let decimals = ctx.accounts.usdc_mint.decimals;
-        transfer_checked(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                TransferChecked {
-                    from: ctx.accounts.bidder_token.to_account_info(),
-                    mint: ctx.accounts.usdc_mint.to_account_info(),
-                    to: ctx.accounts.vault.to_account_info(),
-                    authority: ctx.accounts.bidder.to_account_info(),
-                },
-            ),
+        transfer_to_vault(
+            &ctx.accounts.token_program,
+            &ctx.accounts.bidder_token,
+            &ctx.accounts.usdc_mint,
+            &ctx.accounts.vault,
+            &ctx.accounts.bidder,
             amount,
-            decimals,
         )?;
 
         // 2. Create ProposalTotal + Bid (compressed) under one combined proof.
@@ -218,6 +212,198 @@ pub mod bidon_zk {
 
         Ok(())
     }
+
+    /// Bid on an EXISTING proposal as a NEW backer: pulls USDC, updates the proposal
+    /// aggregate (ProposalTotal) and CREATES this backer's Bid, under one combined proof
+    /// (1 inclusion + 1 new address), then bumps the leader.
+    #[allow(clippy::too_many_arguments)]
+    pub fn raise_bid<'info>(
+        ctx: Context<'_, '_, '_, 'info, RaiseBid<'info>>,
+        proof: ValidityProof,
+        proposal_id: u64,
+        proposal_meta: CompressedAccountMeta,
+        proposal_creator: Pubkey,
+        proposal_content_hash: [u8; 32],
+        proposal_current_total: u64,
+        bid_address_tree_info: PackedAddressTreeInfo,
+        output_state_tree_index: u8,
+        amount: u64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now < ctx.accounts.auction.end_time,
+            BidonError::AuctionEnded
+        );
+        require!(
+            amount >= ctx.accounts.auction.min_bid,
+            BidonError::BelowMinBid
+        );
+
+        let auction_key = ctx.accounts.auction.key();
+        let bidder_key = ctx.accounts.bidder.key();
+
+        transfer_to_vault(&ctx.accounts.token_program, &ctx.accounts.bidder_token, &ctx.accounts.usdc_mint, &ctx.accounts.vault, &ctx.accounts.bidder, amount)?;
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.payer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+
+        // Update the proposal aggregate (input/inclusion, LightAccount index 0).
+        let mut proposal = LightAccount::<ProposalTotal>::new_mut(
+            &crate::ID,
+            &proposal_meta,
+            ProposalTotal {
+                creator: proposal_creator,
+                content_hash: proposal_content_hash,
+                total: proposal_current_total,
+            },
+        )?;
+        let new_total = proposal
+            .total
+            .checked_add(amount)
+            .ok_or(BidonError::Overflow)?;
+        proposal.total = new_total;
+
+        // Create the new Bid (new address, LightAccount index 1).
+        let address_tree_pubkey = bid_address_tree_info
+            .get_tree_pubkey(&light_cpi_accounts)
+            .map_err(|_| ErrorCode::AccountNotEnoughKeys)?;
+        if address_tree_pubkey.to_bytes() != ADDRESS_TREE_V2 {
+            msg!("Invalid address tree");
+            return Err(ProgramError::InvalidAccountData.into());
+        }
+        let pid_le = proposal_id.to_le_bytes();
+        let (bid_address, bid_seed) = derive_address(
+            &[BID_SEED, auction_key.as_ref(), pid_le.as_ref(), bidder_key.as_ref()],
+            &address_tree_pubkey,
+            &crate::ID,
+        );
+        let bid_params =
+            bid_address_tree_info.into_new_address_params_assigned_packed(bid_seed, Some(1));
+
+        let mut bid =
+            LightAccount::<Bid>::new_init(&crate::ID, Some(bid_address), output_state_tree_index);
+        bid.bidder = bidder_key;
+        bid.proposal = proposal_id;
+        bid.amount = amount;
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(proposal)?
+            .with_light_account(bid)?
+            .with_new_addresses(&[bid_params])
+            .invoke(light_cpi_accounts)?;
+
+        let auction = &mut ctx.accounts.auction;
+        auction.total_staked = auction
+            .total_staked
+            .checked_add(amount)
+            .ok_or(BidonError::MathOverflow)?;
+        auction.update_leader(proposal_id, new_total);
+
+        Ok(())
+    }
+
+    /// Top up an EXISTING own Bid (no contention on the bidder's own position): pulls USDC,
+    /// updates both ProposalTotal and Bid (two inclusions, one combined proof), bumps leader.
+    #[allow(clippy::too_many_arguments)]
+    pub fn top_up_bid<'info>(
+        ctx: Context<'_, '_, '_, 'info, RaiseBid<'info>>,
+        proof: ValidityProof,
+        proposal_id: u64,
+        proposal_meta: CompressedAccountMeta,
+        proposal_creator: Pubkey,
+        proposal_content_hash: [u8; 32],
+        proposal_current_total: u64,
+        bid_meta: CompressedAccountMeta,
+        bid_current_amount: u64,
+        amount: u64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now < ctx.accounts.auction.end_time,
+            BidonError::AuctionEnded
+        );
+        require!(
+            amount >= ctx.accounts.auction.min_bid,
+            BidonError::BelowMinBid
+        );
+
+        let bidder_key = ctx.accounts.bidder.key();
+
+        transfer_to_vault(&ctx.accounts.token_program, &ctx.accounts.bidder_token, &ctx.accounts.usdc_mint, &ctx.accounts.vault, &ctx.accounts.bidder, amount)?;
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.payer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+
+        let mut proposal = LightAccount::<ProposalTotal>::new_mut(
+            &crate::ID,
+            &proposal_meta,
+            ProposalTotal {
+                creator: proposal_creator,
+                content_hash: proposal_content_hash,
+                total: proposal_current_total,
+            },
+        )?;
+        let new_total = proposal
+            .total
+            .checked_add(amount)
+            .ok_or(BidonError::Overflow)?;
+        proposal.total = new_total;
+
+        let mut bid = LightAccount::<Bid>::new_mut(
+            &crate::ID,
+            &bid_meta,
+            Bid {
+                bidder: bidder_key,
+                proposal: proposal_id,
+                amount: bid_current_amount,
+            },
+        )?;
+        bid.amount = bid.amount.checked_add(amount).ok_or(BidonError::Overflow)?;
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(proposal)?
+            .with_light_account(bid)?
+            .invoke(light_cpi_accounts)?;
+
+        let auction = &mut ctx.accounts.auction;
+        auction.total_staked = auction
+            .total_staked
+            .checked_add(amount)
+            .ok_or(BidonError::MathOverflow)?;
+        auction.update_leader(proposal_id, new_total);
+
+        Ok(())
+    }
+}
+
+/// Transfer USDC from the bidder's token account into the auction vault.
+fn transfer_to_vault<'info>(
+    token_program: &Program<'info, Token>,
+    from: &Account<'info, TokenAccount>,
+    mint: &Account<'info, Mint>,
+    vault: &Account<'info, TokenAccount>,
+    authority: &Signer<'info>,
+    amount: u64,
+) -> Result<()> {
+    transfer_checked(
+        CpiContext::new(
+            token_program.to_account_info(),
+            TransferChecked {
+                from: from.to_account_info(),
+                mint: mint.to_account_info(),
+                to: vault.to_account_info(),
+                authority: authority.to_account_info(),
+            },
+        ),
+        amount,
+        mint.decimals,
+    )
 }
 
 #[error_code]
@@ -333,6 +519,36 @@ pub struct PlaceBid<'info> {
     /// Bidder — authority for the transfer, signs with 0 SOL.
     pub bidder: Signer<'info>,
     /// Relayer — Light fee payer (gasless).
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Accounts for raise_bid / top_up_bid (same shape as PlaceBid). Compressed accounts
+/// ride in remaining_accounts.
+#[derive(Accounts)]
+pub struct RaiseBid<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(
+        mut,
+        seeds = [AUCTION_SEED, auction.id.to_le_bytes().as_ref()],
+        bump = auction.bump
+    )]
+    pub auction: Account<'info, Auction>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, auction.key().as_ref()],
+        bump,
+        token::mint = config.usdc_mint,
+        token::authority = auction,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+    #[account(address = config.usdc_mint @ BidonError::InvalidMint)]
+    pub usdc_mint: Account<'info, Mint>,
+    #[account(mut, token::mint = config.usdc_mint, token::authority = bidder)]
+    pub bidder_token: Account<'info, TokenAccount>,
+    pub bidder: Signer<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub token_program: Program<'info, Token>,
