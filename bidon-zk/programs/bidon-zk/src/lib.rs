@@ -12,7 +12,9 @@ use light_sdk::{
 };
 use light_sdk::constants::ADDRESS_TREE_V2;
 
-use anchor_spl::token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked};
+use anchor_spl::token::{
+    close_account, transfer_checked, CloseAccount, Mint, Token, TokenAccount, TransferChecked,
+};
 
 declare_id!("6mS4dhHdapQbfiAj9U8k6W9eJAshdA2SRjEi2tXuuAvx");
 
@@ -501,6 +503,35 @@ pub mod bidon_zk {
 
         Ok(())
     }
+
+    /// After end_time, once the creator is paid and the vault is drained, close the vault
+    /// (SPL) and the Auction, returning all rent to the relayer (rent_payer). Permissionless
+    /// GC step — the only rent in the system is recovered here, closing the gasless loop.
+    pub fn close_auction(ctx: Context<CloseAuction>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= ctx.accounts.auction.end_time,
+            BidonError::AuctionNotEnded
+        );
+        require!(ctx.accounts.auction.creator_paid, BidonError::NotSettled);
+        require!(ctx.accounts.vault.amount == 0, BidonError::NotSettled);
+
+        let id_bytes = ctx.accounts.auction.id.to_le_bytes();
+        let bump = ctx.accounts.auction.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
+        close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.vault.to_account_info(),
+                destination: ctx.accounts.rent_recipient.to_account_info(),
+                authority: ctx.accounts.auction.to_account_info(),
+            },
+            signer_seeds,
+        ))?;
+
+        // Auction is closed by Anchor (close = rent_recipient).
+        Ok(())
+    }
 }
 
 /// Transfer USDC out of the auction vault via a PDA signature by the auction authority.
@@ -583,6 +614,8 @@ pub enum BidonError {
     AlreadyClaimed,
     #[msg("The winning proposal's bids cannot be withdrawn")]
     WinnerCannotWithdraw,
+    #[msg("Auction not fully settled (creator unpaid or vault non-empty)")]
+    NotSettled,
 }
 
 #[derive(Accounts)]
@@ -771,6 +804,29 @@ pub struct Withdraw<'info> {
     /// Relayer — Light fee payer (gasless, permissionless crank).
     #[account(mut)]
     pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Accounts for close_auction (permissionless GC): close vault (SPL) + Auction, rent -> relayer.
+#[derive(Accounts)]
+pub struct CloseAuction<'info> {
+    #[account(
+        mut,
+        seeds = [AUCTION_SEED, auction.id.to_le_bytes().as_ref()],
+        bump = auction.bump,
+        close = rent_recipient,
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, auction.key().as_ref()],
+        bump,
+        token::authority = auction,
+    )]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: address checked (== auction.rent_payer); receives the vault + Auction rent.
+    #[account(mut, address = auction.rent_payer @ BidonError::Unauthorized)]
+    pub rent_recipient: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
 }
 

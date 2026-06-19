@@ -574,3 +574,21 @@ pub async fn do_withdraw(
         .await
         .unwrap();
 }
+
+/// close_auction (permissionless GC): close vault + Auction, rent -> relayer (rent_payer).
+pub async fn do_close_auction(rpc: &mut LightProgramTest, ctx: &Ctx) {
+    let ix = Instruction {
+        program_id: bidon_zk::ID,
+        accounts: bidon_zk::accounts::CloseAuction {
+            auction: ctx.auction_pda,
+            vault: ctx.vault_pda,
+            rent_recipient: ctx.payer.pubkey(),
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(None),
+        data: bidon_zk::instruction::CloseAuction {}.data(),
+    };
+    rpc.create_and_send_transaction(&[ix], &ctx.payer.pubkey(), &[&ctx.payer])
+        .await
+        .unwrap();
+}
