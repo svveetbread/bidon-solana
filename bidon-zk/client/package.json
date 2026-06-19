@@ -1,0 +1,17 @@
+{
+  "name": "bidon-zk-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript client + e2e for bidon-zk (parimutuel auctions on ZK Compression)",
+  "scripts": {
+    "e2e": "node e2e.mjs"
+  },
+  "dependencies": {
+    "@lightprotocol/stateless.js": "^0.23.3",
+    "@solana/web3.js": "^1.98.0",
+    "@solana/spl-token": "^0.4.9",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.7"
+  }
+}
