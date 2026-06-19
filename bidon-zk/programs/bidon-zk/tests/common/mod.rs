@@ -12,6 +12,7 @@ use light_sdk::{
     instruction::{account_meta::CompressedAccountMeta, PackedAccounts, SystemAccountMetaConfig},
 };
 use solana_sdk::{
+    clock::Clock,
     compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     pubkey::Pubkey,
@@ -191,17 +192,14 @@ pub async fn do_raise_bid(
         .await
         .unwrap()
         .value;
-    let output_state_tree_index = rpc
-        .get_random_state_tree_info()
-        .unwrap()
-        .pack_output_tree_index(&mut remaining)
-        .unwrap();
     let packed = rpc_result.pack_tree_infos(&mut remaining);
     let state = packed.state_trees.unwrap();
+    // Proposal update output and the new Bid output must share ONE state tree.
+    let output_state_tree_index = state.output_tree_index;
     let proposal_meta = CompressedAccountMeta {
         tree_info: state.packed_tree_infos[0],
         address: p_acc.address.unwrap(),
-        output_state_tree_index: state.output_tree_index,
+        output_state_tree_index,
     };
 
     let data = bidon_zk::instruction::RaiseBid {
@@ -461,4 +459,118 @@ pub async fn proposal_total(rpc: &mut LightProgramTest, address: [u8; 32]) -> Pr
 
 pub async fn bid_state(rpc: &mut LightProgramTest, address: [u8; 32]) -> Bid {
     decode(&compressed(rpc, address).await)
+}
+
+/// Advance the Clock's unix_timestamp by `secs` (to cross end_time gates).
+pub fn warp_past(rpc: &mut LightProgramTest, secs: i64) {
+    let mut clock = rpc.context.get_sysvar::<Clock>();
+    clock.unix_timestamp += secs;
+    rpc.context.set_sysvar(&clock);
+}
+
+/// Create an empty USDC token account owned by `owner`.
+pub async fn token_account(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+    mint: Pubkey,
+    owner: &Pubkey,
+) -> Pubkey {
+    let acc = Keypair::new();
+    let rent = rpc.get_minimum_balance_for_rent_exemption(165).await.unwrap();
+    let create =
+        system_instruction::create_account(&payer.pubkey(), &acc.pubkey(), rent, 165, &spl_token::ID);
+    let init =
+        spl_token::instruction::initialize_account3(&spl_token::ID, &acc.pubkey(), &mint, owner)
+            .unwrap();
+    rpc.create_and_send_transaction(&[create, init], &payer.pubkey(), &[payer, &acc])
+        .await
+        .unwrap();
+    acc.pubkey()
+}
+
+/// claim_winnings (permissionless; relayer pays the tx fee).
+pub async fn do_claim(
+    rpc: &mut LightProgramTest,
+    ctx: &Ctx,
+    creator_token: Pubkey,
+    fee_receiver_token: Pubkey,
+) {
+    let ix = Instruction {
+        program_id: bidon_zk::ID,
+        accounts: bidon_zk::accounts::ClaimWinnings {
+            config: ctx.config_pda,
+            auction: ctx.auction_pda,
+            vault: ctx.vault_pda,
+            creator_token,
+            fee_receiver_token,
+            usdc_mint: ctx.mint,
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(None),
+        data: bidon_zk::instruction::ClaimWinnings {}.data(),
+    };
+    rpc.create_and_send_transaction(&[ix], &ctx.payer.pubkey(), &[&ctx.payer])
+        .await
+        .unwrap();
+}
+
+/// withdraw a losing bid (permissionless): refund USDC + close the compressed Bid.
+pub async fn do_withdraw(
+    rpc: &mut LightProgramTest,
+    ctx: &Ctx,
+    bidder: Pubkey,
+    bidder_token: Pubkey,
+    pid: u64,
+    current_amount: u64,
+) {
+    let b_addr = bid_address(rpc, ctx.auction_pda, pid, bidder);
+    let b_acc = compressed(rpc, b_addr).await;
+
+    let mut remaining = PackedAccounts::default();
+    remaining
+        .add_system_accounts_v2(SystemAccountMetaConfig::new(bidon_zk::ID))
+        .unwrap();
+    let rpc_result = rpc
+        .get_validity_proof(vec![b_acc.hash], vec![], None)
+        .await
+        .unwrap()
+        .value;
+    let packed = rpc_result.pack_tree_infos(&mut remaining);
+    let state = packed.state_trees.unwrap();
+    let bid_meta = CompressedAccountMeta {
+        tree_info: state.packed_tree_infos[0],
+        address: b_acc.address.unwrap(),
+        output_state_tree_index: state.output_tree_index,
+    };
+
+    let data = bidon_zk::instruction::Withdraw {
+        proof: rpc_result.proof,
+        proposal_id: pid,
+        bidder,
+        bid_meta,
+        bid_current_amount: current_amount,
+    }
+    .data();
+    let mut metas = bidon_zk::accounts::Withdraw {
+        config: ctx.config_pda,
+        auction: ctx.auction_pda,
+        vault: ctx.vault_pda,
+        bidder_token,
+        usdc_mint: ctx.mint,
+        payer: ctx.payer.pubkey(),
+        token_program: spl_token::ID,
+    }
+    .to_account_metas(None);
+    let (rem, _, _) = remaining.to_account_metas();
+    metas.extend(rem);
+
+    let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+    let ix = Instruction {
+        program_id: bidon_zk::ID,
+        accounts: metas,
+        data,
+    };
+    rpc.create_and_send_transaction(&[cu, ix], &ctx.payer.pubkey(), &[&ctx.payer])
+        .await
+        .unwrap();
 }

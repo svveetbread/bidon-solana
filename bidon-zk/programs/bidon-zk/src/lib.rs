@@ -380,6 +380,155 @@ pub mod bidon_zk {
 
         Ok(())
     }
+
+    /// After end_time, pay the winning pool to the creator minus fee. Permissionless —
+    /// funds can only flow to the creator's and the fee_receiver's token accounts. Vault
+    /// is drained via a PDA signature by the auction authority.
+    pub fn claim_winnings(ctx: Context<ClaimWinnings>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= ctx.accounts.auction.end_time,
+            BidonError::AuctionNotEnded
+        );
+        require!(!ctx.accounts.auction.creator_paid, BidonError::AlreadyClaimed);
+
+        let winner_amount = ctx.accounts.auction.winner_amount;
+        let fee_bps = ctx.accounts.auction.fee_bps as u64;
+        let fee = winner_amount
+            .checked_mul(fee_bps)
+            .ok_or(BidonError::MathOverflow)?
+            .checked_div(10_000)
+            .ok_or(BidonError::MathOverflow)?;
+        let payout = winner_amount.checked_sub(fee).ok_or(BidonError::MathOverflow)?;
+
+        let decimals = ctx.accounts.usdc_mint.decimals;
+        let id_bytes = ctx.accounts.auction.id.to_le_bytes();
+        let bump = ctx.accounts.auction.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
+
+        if payout > 0 {
+            vault_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.creator_token,
+                &ctx.accounts.auction,
+                signer_seeds,
+                payout,
+                decimals,
+            )?;
+        }
+        if fee > 0 {
+            vault_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.fee_receiver_token,
+                &ctx.accounts.auction,
+                signer_seeds,
+                fee,
+                decimals,
+            )?;
+        }
+
+        ctx.accounts.auction.creator_paid = true;
+        Ok(())
+    }
+
+    /// After end_time, a LOSING bidder reclaims their stake: transfer USDC back from the
+    /// vault and CLOSE the compressed Bid (a closed compressed account cannot be reused —
+    /// double-refund guard). Permissionless; payer (relayer) is the Light fee payer; the
+    /// bidder is identified by argument (no bidder signature). Funds go only to the
+    /// bidder's token account.
+    pub fn withdraw<'info>(
+        ctx: Context<'_, '_, '_, 'info, Withdraw<'info>>,
+        proof: ValidityProof,
+        proposal_id: u64,
+        bidder: Pubkey,
+        bid_meta: CompressedAccountMeta,
+        bid_current_amount: u64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= ctx.accounts.auction.end_time,
+            BidonError::AuctionNotEnded
+        );
+        require!(
+            proposal_id != ctx.accounts.auction.winner_proposal,
+            BidonError::WinnerCannotWithdraw
+        );
+        require!(
+            ctx.accounts.bidder_token.owner == bidder,
+            BidonError::Unauthorized
+        );
+
+        let decimals = ctx.accounts.usdc_mint.decimals;
+        let id_bytes = ctx.accounts.auction.id.to_le_bytes();
+        let bump = ctx.accounts.auction.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
+
+        if bid_current_amount > 0 {
+            vault_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.bidder_token,
+                &ctx.accounts.auction,
+                signer_seeds,
+                bid_current_amount,
+                decimals,
+            )?;
+        }
+
+        // Close the compressed Bid (double-refund guard).
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.payer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+        let bid = LightAccount::<Bid>::new_close(
+            &crate::ID,
+            &bid_meta,
+            Bid {
+                bidder,
+                proposal: proposal_id,
+                amount: bid_current_amount,
+            },
+        )?;
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(bid)?
+            .invoke(light_cpi_accounts)?;
+
+        Ok(())
+    }
+}
+
+/// Transfer USDC out of the auction vault via a PDA signature by the auction authority.
+#[allow(clippy::too_many_arguments)]
+fn vault_transfer<'info>(
+    token_program: &Program<'info, Token>,
+    vault: &Account<'info, TokenAccount>,
+    mint: &Account<'info, Mint>,
+    to: &Account<'info, TokenAccount>,
+    auction: &Account<'info, Auction>,
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+    decimals: u8,
+) -> Result<()> {
+    transfer_checked(
+        CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            TransferChecked {
+                from: vault.to_account_info(),
+                mint: mint.to_account_info(),
+                to: to.to_account_info(),
+                authority: auction.to_account_info(),
+            },
+            signer_seeds,
+        ),
+        amount,
+        decimals,
+    )
 }
 
 /// Transfer USDC from the bidder's token account into the auction vault.
@@ -428,6 +577,12 @@ pub enum BidonError {
     AuctionEnded,
     #[msg("Bid is below the auction minimum")]
     BelowMinBid,
+    #[msg("Auction has not ended yet")]
+    AuctionNotEnded,
+    #[msg("Winnings already claimed")]
+    AlreadyClaimed,
+    #[msg("The winning proposal's bids cannot be withdrawn")]
+    WinnerCannotWithdraw,
 }
 
 #[derive(Accounts)]
@@ -549,6 +704,71 @@ pub struct RaiseBid<'info> {
     #[account(mut, token::mint = config.usdc_mint, token::authority = bidder)]
     pub bidder_token: Account<'info, TokenAccount>,
     pub bidder: Signer<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Accounts for claim_winnings (regular accounts only; vault drained via PDA signature).
+#[derive(Accounts)]
+pub struct ClaimWinnings<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(
+        mut,
+        seeds = [AUCTION_SEED, auction.id.to_le_bytes().as_ref()],
+        bump = auction.bump
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, auction.key().as_ref()],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = auction,
+    )]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        constraint = creator_token.owner == auction.creator @ BidonError::Unauthorized,
+        constraint = creator_token.mint == config.usdc_mint @ BidonError::InvalidMint,
+    )]
+    pub creator_token: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        constraint = fee_receiver_token.owner == config.fee_receiver @ BidonError::Unauthorized,
+        constraint = fee_receiver_token.mint == config.usdc_mint @ BidonError::InvalidMint,
+    )]
+    pub fee_receiver_token: Box<Account<'info, TokenAccount>>,
+    #[account(constraint = usdc_mint.key() == config.usdc_mint @ BidonError::InvalidMint)]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Accounts for withdraw (hybrid: regular vault transfer + compressed Bid close).
+/// Compressed accounts ride in remaining_accounts. bidder is an argument (permissionless).
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(
+        seeds = [AUCTION_SEED, auction.id.to_le_bytes().as_ref()],
+        bump = auction.bump
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, auction.key().as_ref()],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = auction,
+    )]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, constraint = bidder_token.mint == config.usdc_mint @ BidonError::InvalidMint)]
+    pub bidder_token: Box<Account<'info, TokenAccount>>,
+    #[account(constraint = usdc_mint.key() == config.usdc_mint @ BidonError::InvalidMint)]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+    /// Relayer — Light fee payer (gasless, permissionless crank).
     #[account(mut)]
     pub payer: Signer<'info>,
     pub token_program: Program<'info, Token>,
