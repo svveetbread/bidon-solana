@@ -12,10 +12,18 @@ use light_sdk::{
 };
 use light_sdk::constants::ADDRESS_TREE_V2;
 
+use anchor_spl::token::{Mint, Token, TokenAccount};
+
 declare_id!("6mS4dhHdapQbfiAj9U8k6W9eJAshdA2SRjEi2tXuuAvx");
 
 pub const LIGHT_CPI_SIGNER: CpiSigner =
     derive_light_cpi_signer!("6mS4dhHdapQbfiAj9U8k6W9eJAshdA2SRjEi2tXuuAvx");
+
+// ---- regular-account seeds & limits (Config / Auction / Vault) ----
+pub const CONFIG_SEED: &[u8] = b"config";
+pub const AUCTION_SEED: &[u8] = b"auction";
+pub const VAULT_SEED: &[u8] = b"vault";
+pub const MAX_FEE_BPS: u16 = 1000;
 
 // Spike core: a rent-free compressed Bid (per proposal_id, bidder).
 // create (place_bid) -> update (raise_bid, own top-up, no contention)
@@ -317,6 +325,78 @@ pub mod bidon_zk {
 
         Ok(())
     }
+
+    // ---- regular-account instructions (Config / Auction / Vault) ----
+
+    /// Initialize the singleton Config (fee <= 10%).
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        fee_bps: u16,
+        fee_receiver: Pubkey,
+        usdc_mint: Pubkey,
+    ) -> Result<()> {
+        require!(fee_bps <= MAX_FEE_BPS, BidonError::FeeTooHigh);
+        let config = &mut ctx.accounts.config;
+        config.owner = ctx.accounts.owner.key();
+        config.fee_bps = fee_bps;
+        config.fee_receiver = fee_receiver;
+        config.usdc_mint = usdc_mint;
+        config.auction_count = 0;
+        config.bump = ctx.bumps.config;
+        Ok(())
+    }
+
+    /// Owner-only fee update.
+    pub fn set_config(ctx: Context<SetConfig>, fee_bps: u16, fee_receiver: Pubkey) -> Result<()> {
+        require!(fee_bps <= MAX_FEE_BPS, BidonError::FeeTooHigh);
+        let config = &mut ctx.accounts.config;
+        config.fee_bps = fee_bps;
+        config.fee_receiver = fee_receiver;
+        Ok(())
+    }
+
+    /// Create an auction + its USDC vault — the ONLY rent in the system. The relayer
+    /// (`payer`) fronts SOL for rent; the creator signs as authority with 0 SOL.
+    /// No upper cap on duration (only > 0). Gates are time-based (finalize removed).
+    pub fn create_auction(
+        ctx: Context<CreateAuction>,
+        id: u64,
+        min_bid: u64,
+        duration_secs: i64,
+    ) -> Result<()> {
+        require!(
+            id == ctx.accounts.config.auction_count,
+            BidonError::InvalidAuctionId
+        );
+        require!(duration_secs > 0, BidonError::InvalidDuration);
+
+        let now = Clock::get()?.unix_timestamp;
+        let fee_bps = ctx.accounts.config.fee_bps;
+
+        let auction = &mut ctx.accounts.auction;
+        auction.id = id;
+        auction.creator = ctx.accounts.creator.key();
+        auction.min_bid = min_bid;
+        auction.fee_bps = fee_bps;
+        auction.end_time = now
+            .checked_add(duration_secs)
+            .ok_or(BidonError::MathOverflow)?;
+        auction.creator_paid = false;
+        auction.total_staked = 0;
+        auction.proposal_count = 0;
+        auction.winner_proposal = 0;
+        auction.winner_amount = 0;
+        auction.rent_payer = ctx.accounts.payer.key();
+        auction.bump = ctx.bumps.auction;
+
+        ctx.accounts.config.auction_count = ctx
+            .accounts
+            .config
+            .auction_count
+            .checked_add(1)
+            .ok_or(BidonError::MathOverflow)?;
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -325,12 +405,86 @@ pub enum BidonError {
     InvalidAmount,
     #[msg("Bid amount overflow")]
     Overflow,
+    #[msg("Fee exceeds maximum (10%)")]
+    FeeTooHigh,
+    #[msg("Only the config owner may do this")]
+    Unauthorized,
+    #[msg("Mint does not match the configured USDC mint")]
+    InvalidMint,
+    #[msg("Auction id must equal the current auction_count")]
+    InvalidAuctionId,
+    #[msg("Duration must be greater than zero")]
+    InvalidDuration,
+    #[msg("Math overflow")]
+    MathOverflow,
 }
 
 #[derive(Accounts)]
 pub struct GenericAnchorAccounts<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + Config::INIT_SPACE,
+        seeds = [CONFIG_SEED],
+        bump
+    )]
+    pub config: Account<'info, Config>,
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetConfig<'info> {
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        has_one = owner @ BidonError::Unauthorized
+    )]
+    pub config: Account<'info, Config>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(id: u64)]
+pub struct CreateAuction<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Auction::INIT_SPACE,
+        seeds = [AUCTION_SEED, id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub auction: Account<'info, Auction>,
+    /// Platform USDC mint (from config).
+    #[account(constraint = usdc_mint.key() == config.usdc_mint @ BidonError::InvalidMint)]
+    pub usdc_mint: Account<'info, Mint>,
+    /// Auction USDC vault: PDA token account, authority = the auction itself.
+    #[account(
+        init,
+        payer = payer,
+        seeds = [VAULT_SEED, auction.key().as_ref()],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = auction,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+    /// Auction creator — authority (signs), pays NO rent.
+    pub creator: Signer<'info>,
+    /// Rent + tx-fee payer (relayer/gasless). Rent refunded to it on close.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 // #[event] makes the struct part of the Anchor IDL for client decoding.
@@ -353,4 +507,50 @@ pub struct ProposalTotal {
     #[hash]
     pub content_hash: [u8; 32],
     pub total: u64,
+}
+
+// ---- regular (uncompressed) accounts: Config / Auction ----
+
+/// Global registry config (singleton PDA, seed "config").
+#[account]
+#[derive(InitSpace)]
+pub struct Config {
+    pub owner: Pubkey,
+    pub fee_bps: u16,
+    pub fee_receiver: Pubkey,
+    pub usdc_mint: Pubkey,
+    pub auction_count: u64,
+    pub bump: u8,
+}
+
+/// Auction (PDA seed "auction" + id LE). The hot global leader is a regular account
+/// (native serialization). No `finalized`: all gates are time-based (now >= end_time).
+#[account]
+#[derive(InitSpace)]
+pub struct Auction {
+    pub id: u64,
+    pub creator: Pubkey,
+    pub min_bid: u64,
+    pub fee_bps: u16,
+    pub end_time: i64,
+    pub creator_paid: bool,
+    pub total_staked: u64,
+    pub proposal_count: u64,
+    /// Leader = proposal_id with the max running total (incremental, strict >).
+    pub winner_proposal: u64,
+    pub winner_amount: u64,
+    /// Who fronted rent for Auction+vault (relayer) — refunded on close.
+    pub rent_payer: Pubkey,
+    pub bump: u8,
+}
+
+impl Auction {
+    /// Update the leader only if a proposal's total strictly exceeds the current max
+    /// (a tie keeps the earlier leader).
+    pub fn update_leader(&mut self, proposal_id: u64, total: u64) {
+        if total > self.winner_amount {
+            self.winner_proposal = proposal_id;
+            self.winner_amount = total;
+        }
+    }
 }
