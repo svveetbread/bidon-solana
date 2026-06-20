@@ -11,7 +11,12 @@ import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
 // ---- constants ----
 export const PROGRAM_ID = new PublicKey('4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz');
+// Send/blockhash RPC: public devnet (synced). Override via SOLANA_DEVNET_RPC.
 export const RPC_URL = process.env.SOLANA_DEVNET_RPC || 'https://api.devnet.solana.com';
+// Photon RPC for validity proofs + compressed reads (Helius). Its indexer is fresh even
+// when the plain getSlot node lags — we read proofs here, send tx over RPC_URL.
+export const HELIUS_RPC = process.env.HELIUS_RPC ||
+  'https://devnet.helius-rpc.com/?api-key=1b609455-ac51-4d3e-908d-2cc55ea9f738';
 
 const CONFIG_SEED = Buffer.from('config');
 const AUCTION_SEED = Buffer.from('auction');
@@ -25,6 +30,8 @@ export function disc(name) {
 // ---- borsh primitive encoders ----
 export const u8 = (n) => { const b = Buffer.alloc(1); b.writeUInt8(Number(n)); return b; };
 export const u16 = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(Number(n)); return b; };
+export const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(Number(n)); return b; };
+export const boolByte = (v) => Buffer.from([v ? 1 : 0]);
 export const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
 export const i64 = (n) => { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(n)); return b; };
 export const pk = (p) => (p instanceof PublicKey ? p : new PublicKey(p)).toBuffer();
