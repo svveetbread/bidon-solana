@@ -21,13 +21,20 @@ allowed_programs = [
 allowed_tokens = [
   "5buueP7zgapsJrraPATUpSE2c7hLc35GhkKWwM2GFPyY", # our devnet test USDC mint
 ]
-allowed_spl_paid_tokens = []
+allowed_spl_paid_tokens = [
+  "5buueP7zgapsJrraPATUpSE2c7hLc35GhkKWwM2GFPyY", # USDC как платёжный токен (★2 газ-в-USDC)
+]
 disallowed_accounts = []
 
-# PoC: relayer subsidizes gas (no USDC charge). Production → switch to Margin/Fixed with
-# allowed_spl_paid_tokens = [USDC] so users pay gas in USDC (Kora-margin model).
+# ★2 ДЕМО на devnet: Fixed — юзер платит плоско 0.01 USDC за газ/операцию (видимое списание).
+# price_source = "Mock" даёт цену для любого mint → fee_in_token round-trip'ится в `amount`.
+# Mainnet (реальный anti-spam): type="margin" + price_source="Jupiter" + реальный USDC →
+# createAuction берёт ренту с создателя, ставки — Light-fee; релейер не дрейнится.
 [validation.price]
-type = "free"
+type = "fixed"
+amount = 10000     # 0.01 USDC (6 decimals)
+token = "5buueP7zgapsJrraPATUpSE2c7hLc35GhkKWwM2GFPyY"
+strict = false
 
 # Kora inspects CPI too, so the fee payer must be explicitly allowed to create accounts
 # (create_auction inits Auction + Vault, rent paid by Kora) and to do System Transfer
