@@ -198,6 +198,47 @@ async function testSettle(conn, lrpc, ctx) {
   ok((await conn.getAccountInfo(auc.vault)) === null, 'vault account closed');
 }
 
+// Concurrency: two backers build raise against the SAME proposal state. The first
+// lands and nullifies the proposal hash; the second carries a now-stale proof and is
+// rejected on-chain; a client retry with a fresh proof succeeds. Validates the
+// nullifier model (contention = latency, not a cap).
+async function testConcurrency(conn, lrpc, ctx) {
+  console.log('\n== concurrency: stale-proof nullifier → client retry ==');
+  const auc = await createAuction(conn, ctx, 3600n);
+  const actx = { ...ctx, auction: auc.auction, vault: auc.vault };
+
+  const b0 = await fundedBidder(conn, ctx.payer, ctx.mint, 1_000_000n);
+  const p0 = await buildPlaceBid(lrpc, actx, b0.bidder, b0.bidderToken, 0n, contentHash('hot proposal'), 1_000_000n);
+  await sendIx(conn, [cuLimit(400_000), p0.ix], ctx.payer, [b0.bidder], 'place');
+  await waitCompressed(lrpc, p0.proposalAddress);
+
+  // both built against the same current proposal state
+  const ba = await fundedBidder(conn, ctx.payer, ctx.mint, 300_000n);
+  const bb = await fundedBidder(conn, ctx.payer, ctx.mint, 300_000n);
+  const builtA = await buildRaiseBid(lrpc, actx, ba.bidder, ba.bidderToken, 0n, 300_000n);
+  const builtB = await buildRaiseBid(lrpc, actx, bb.bidder, bb.bidderToken, 0n, 300_000n);
+
+  await sendIx(conn, [cuLimit(400_000), builtA.ix], ctx.payer, [ba.bidder], 'raise A');
+  console.log('  raise A landed (nullifies proposal hash)');
+
+  let rejected = false;
+  try {
+    await sendIx(conn, [cuLimit(400_000), builtB.ix], ctx.payer, [bb.bidder], 'raise B (stale)');
+  } catch (e) {
+    rejected = true;
+    console.log('  raise B stale-proof rejected on-chain (expected):', (e.transactionMessage || e.message || '').slice(0, 70));
+  }
+  ok(rejected, 'concurrent raise with stale proof rejected on-chain');
+
+  await waitCompressed(lrpc, builtA.bidAddress); // let A index so B sees fresh state
+  const retryB = await buildRaiseBid(lrpc, actx, bb.bidder, bb.bidderToken, 0n, 300_000n);
+  await sendIx(conn, [cuLimit(400_000), retryB.ix], ctx.payer, [bb.bidder], 'raise B retry');
+  console.log('  raise B retry with fresh proof landed');
+
+  const pAcc = await waitCompressed(lrpc, p0.proposalAddress);
+  ok(decodeProposalTotal(pAcc.data.data).total === 1_600_000n, 'ProposalTotal.total == 1.6M (1M + A 0.3M + B 0.3M)');
+}
+
 async function main() {
   console.log('send RPC:', RPC_URL, '\nphoton  :', HELIUS_RPC.split('?')[0]);
   const conn = connection();
@@ -210,15 +251,20 @@ async function main() {
   const ctx = { payer: relayer, config: configPda(), mint };
   console.log('Config: fee', cfg.feeBps, '| auctions', cfg.auctionCount.toString());
 
-  console.log('\n== create_auction (gasless) ==');
-  const auc = await createAuction(conn, ctx);
+  const only = process.argv[2]; // e.g. "concurrency" to run just that scenario
+  if (only === 'concurrency') {
+    await testConcurrency(conn, lrpc, ctx);
+  } else {
+    console.log('\n== create_auction (gasless) ==');
+    const auc = await createAuction(conn, ctx);
+    const b1 = await testPlaceBid(conn, lrpc, ctx, auc);
+    await testRaiseBid(conn, lrpc, ctx, auc);
+    await testTopUpBid(conn, lrpc, ctx, auc, b1);
+    await testSettle(conn, lrpc, ctx);
+    await testConcurrency(conn, lrpc, ctx);
+  }
 
-  const b1 = await testPlaceBid(conn, lrpc, ctx, auc);
-  await testRaiseBid(conn, lrpc, ctx, auc);
-  await testTopUpBid(conn, lrpc, ctx, auc, b1);
-  await testSettle(conn, lrpc, ctx);
-
-  console.log('\nE2E OK — place/raise/top_up + claim/withdraw/close (Σin==Σout)');
+  console.log('\nE2E OK — place/raise/top_up + claim/withdraw/close (Σin==Σout) + concurrency-retry');
 }
 
 main().catch((e) => { console.error('\nE2E FAIL:', e); process.exit(1); });
