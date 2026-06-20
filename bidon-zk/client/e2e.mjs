@@ -1,6 +1,7 @@
 // bidon-zk devnet e2e. Grows step by step.
 //  - non-Light: setup (mint + Config), create_auction
 //  - Light: place_bid (proof via Helius Photon, tx sent over public RPC)
+import './load-env.mjs'; // must be first — loads .env before lib.mjs reads process.env
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
 import { Keypair, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';

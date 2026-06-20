@@ -15,8 +15,11 @@ export const PROGRAM_ID = new PublicKey('4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkx
 export const RPC_URL = process.env.SOLANA_DEVNET_RPC || 'https://api.devnet.solana.com';
 // Photon RPC for validity proofs + compressed reads (Helius). Its indexer is fresh even
 // when the plain getSlot node lags — we read proofs here, send tx over RPC_URL.
+// Set HELIUS_RPC or HELIUS_API_KEY in .env (gitignored). Import load-env.mjs first.
 export const HELIUS_RPC = process.env.HELIUS_RPC ||
-  'https://devnet.helius-rpc.com/?api-key=1b609455-ac51-4d3e-908d-2cc55ea9f738';
+  (process.env.HELIUS_API_KEY
+    ? `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`
+    : null);
 
 const CONFIG_SEED = Buffer.from('config');
 const AUCTION_SEED = Buffer.from('auction');
