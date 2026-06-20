@@ -1,0 +1,11 @@
+# Single memory signer = our relayer keypair (fee payer).
+# Base58 key in KORA_PRIVATE_KEY (kora/.env, gitignored).
+# Pubkey: 8pXtJA3S4BMiquYqZTBn8BJbUsEWvrsGuy6L6joT9q5g
+[signer_pool]
+strategy = "round_robin"
+
+[[signers]]
+name = "bidon-relayer"
+weight = 1
+type = "memory"
+private_key_env = "KORA_PRIVATE_KEY"

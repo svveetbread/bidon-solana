@@ -1,0 +1,39 @@
+# Kora relayer config for bidon-zk gasless PoC (devnet).
+# Fee payer = our relayer keypair (8pXtJA); users sign their authority part with 0 SOL,
+# Kora adds the fee-payer signature and pays SOL (rent + Light CPI fee + tx fee).
+[kora]
+rate_limit = 100
+
+[validation]
+max_allowed_lamports = 100000000   # 0.1 SOL ceiling per tx (auction rent ~0.0046)
+max_signatures = 12
+price_source = "Mock"              # PoC: no Jupiter pricing yet
+allowed_programs = [
+  "4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz", # bidon-zk
+  "ComputeBudget111111111111111111111111111111",
+  "11111111111111111111111111111111",             # System
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # SPL Token
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", # Associated Token
+  "SySTEM1eSU2p4BGQfQpimFEWWSC1XDFeun3Nqzz3rT7",  # Light System
+  "compr6CUsB5m2jS4Y3831ztGSTnDpnKJTKS95d64XVq",  # Account Compression
+  "Lighton6oQpVkeewmo2mcPTQQp7kYHr4fWpAgJyEmDX",  # Light Registry
+]
+allowed_tokens = [
+  "5buueP7zgapsJrraPATUpSE2c7hLc35GhkKWwM2GFPyY", # our devnet test USDC mint
+]
+allowed_spl_paid_tokens = []
+disallowed_accounts = []
+
+# PoC: relayer subsidizes gas (no USDC charge). Production → switch to Margin/Fixed with
+# allowed_spl_paid_tokens = [USDC] so users pay gas in USDC (Kora-margin model).
+[validation.price]
+type = "free"
+
+# Kora inspects CPI too, so the fee payer must be explicitly allowed to create accounts
+# (create_auction inits Auction + Vault, rent paid by Kora) and to do System Transfer
+# (Light CPI network fee). nonce/spl_token/token_2022 stay default (false).
+[validation.fee_payer_policy.system]
+allow_transfer = true
+allow_assign = false
+allow_create_account = true
+allow_allocate = false
