@@ -532,6 +532,33 @@ pub mod bidon_zk {
         // Auction is closed by Anchor (close = rent_recipient).
         Ok(())
     }
+
+    /// Creator cancels an EMPTY auction (proposal_count == 0): closes the vault (SPL) and the
+    /// Auction, returning all rent to the relayer (rent_payer). Creator-only, no time gate.
+    /// Atomic vs the race: a place_bid landing first makes proposal_count > 0 and this reverts;
+    /// if this lands first, the Auction is gone and place_bid reverts.
+    pub fn cancel_auction(ctx: Context<CancelAuction>) -> Result<()> {
+        require!(
+            ctx.accounts.auction.proposal_count == 0,
+            BidonError::AuctionNotEmpty
+        );
+
+        let id_bytes = ctx.accounts.auction.id.to_le_bytes();
+        let bump = ctx.accounts.auction.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
+        close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.vault.to_account_info(),
+                destination: ctx.accounts.rent_recipient.to_account_info(),
+                authority: ctx.accounts.auction.to_account_info(),
+            },
+            signer_seeds,
+        ))?;
+
+        // Auction is closed by Anchor (close = rent_recipient).
+        Ok(())
+    }
 }
 
 /// Transfer USDC out of the auction vault via a PDA signature by the auction authority.
@@ -616,6 +643,8 @@ pub enum BidonError {
     WinnerCannotWithdraw,
     #[msg("Auction not fully settled (creator unpaid or vault non-empty)")]
     NotSettled,
+    #[msg("Auction is not empty (has proposals) — cannot cancel")]
+    AuctionNotEmpty,
 }
 
 #[derive(Accounts)]
@@ -824,6 +853,32 @@ pub struct CloseAuction<'info> {
         token::authority = auction,
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: address checked (== auction.rent_payer); receives the vault + Auction rent.
+    #[account(mut, address = auction.rent_payer @ BidonError::Unauthorized)]
+    pub rent_recipient: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Accounts for cancel_auction (creator-only, EMPTY auction): close vault + Auction, rent -> relayer.
+#[derive(Accounts)]
+pub struct CancelAuction<'info> {
+    #[account(
+        mut,
+        seeds = [AUCTION_SEED, auction.id.to_le_bytes().as_ref()],
+        bump = auction.bump,
+        has_one = creator @ BidonError::Unauthorized, // только создатель
+        close = rent_recipient,
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, auction.key().as_ref()],
+        bump,
+        token::authority = auction,
+    )]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    /// Auction creator — authority (signs), pays NO rent (0 SOL ok; relayer is the fee-payer).
+    pub creator: Signer<'info>,
     /// CHECK: address checked (== auction.rent_payer); receives the vault + Auction rent.
     #[account(mut, address = auction.rent_payer @ BidonError::Unauthorized)]
     pub rent_recipient: UncheckedAccount<'info>,
