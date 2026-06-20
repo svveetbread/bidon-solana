@@ -151,7 +151,7 @@ export async function buildRaiseBid(rpc, ctx, bidder, bidderToken, pid, amount) 
     keys: [...bidAccounts(ctx, bidder.publicKey, bidderToken), ...remainingAccounts],
     data,
   });
-  return { ix, bidAddress: bAddr, proposalTotalBefore: pState.total };
+  return { ix, bidAddress: bAddr, proposalAddress: pAddr, proposalTotalBefore: pState.total };
 }
 
 // top_up_bid: own existing Bid — update both ProposalTotal and Bid (two inclusions).
@@ -207,7 +207,7 @@ export async function buildTopUpBid(rpc, ctx, bidder, bidderToken, pid, amount) 
     keys: [...bidAccounts(ctx, bidder.publicKey, bidderToken), ...remainingAccounts],
     data,
   });
-  return { ix };
+  return { ix, proposalAddress: pAddr, bidAddress: bAddr };
 }
 
 // withdraw: after end_time, losing bidder reclaims stake + close compressed Bid. Permissionless.
