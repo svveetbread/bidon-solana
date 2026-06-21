@@ -84,12 +84,16 @@ async function resolveAuction(cfg, a) {
     }
   }
 
-  // 3) закрытие (рента релейеру). Упадёт, если vault ещё не опустошён — ретрай позже.
-  try {
-    await sendIx(conn, ixCloseAuction({ id, rentRecipient: relayer.publicKey }), relayer, [], `close`);
-    console.log(`[#${id}] ✓ закрыт`);
-  } catch (e) {
-    /* ещё не готов (остались возвраты) — следующий цикл */
+  // 3) закрытие — ПО УМОЛЧАНИЮ НЕ закрываем: close_auction убирает аккаунт с чейна → аукцион исчезает
+  //    из списка («Аукцион не найден»). Для демо/UX аукцион должен оставаться видимым как «завершён».
+  //    Рента релейера остаётся залочена до close. Включить чистку: KEEPER_CLOSE=true (для прод-масштаба).
+  if (process.env.KEEPER_CLOSE === 'true') {
+    try {
+      await sendIx(conn, ixCloseAuction({ id, rentRecipient: relayer.publicKey }), relayer, [], `close`);
+      console.log(`[#${id}] ✓ закрыт`);
+    } catch (e) {
+      /* ещё не готов (остались возвраты) — следующий цикл */
+    }
   }
 }
 
