@@ -4,6 +4,12 @@
 [kora]
 rate_limit = 100
 
+[kora.auth]
+# Devnet-демо: api-key auth. Браузер шлёт ключ через Vite-прокси (серверный, НЕ в бандле) → внешние
+# клиенты без ключа на 0.0.0.0:8080 отсекаются (релейер не дрейнится анонимами). Прод: HMAC + ключ из
+# секрет-стора хостинга (не в репо) + bind 127.0.0.1 за reverse-proxy.
+api_key = "***REMOVED***"
+
 [validation]
 max_allowed_lamports = 100000000   # 0.1 SOL ceiling per tx (auction rent ~0.0046)
 max_signatures = 12
