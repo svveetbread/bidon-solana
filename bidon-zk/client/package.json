@@ -5,7 +5,9 @@
   "type": "module",
   "description": "TypeScript client + e2e for bidon-zk (parimutuel auctions on ZK Compression)",
   "scripts": {
-    "e2e": "node e2e.mjs"
+    "e2e": "node e2e.mjs",
+    "keeper": "node keeper.mjs",
+    "start": "node keeper.mjs"
   },
   "dependencies": {
     "@lightprotocol/stateless.js": "^0.23.3",

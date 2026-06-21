@@ -165,10 +165,23 @@ export function decodeAuction(buf) {
   const winnerProposal = buf.readBigUInt64LE(o); o += 8;
   const winnerAmount = buf.readBigUInt64LE(o); o += 8;
   const rentPayer = new PublicKey(buf.subarray(o, o + 32)); o += 32;
-  const bump = buf.readUInt8(o);
+  const bump = buf.readUInt8(o); o += 1;
+  // top-N в конце (старый layout = префикс): winner_count(1) + winners[10]{pid,total}=160 + winners_filled(1) + schema_version(1)
+  let winnerCount = 1, winners = [], winnersFilled = 0, schemaVersion = 0;
+  if (buf.length >= o + 163) {
+    winnerCount = buf.readUInt8(o); o += 1;
+    for (let i = 0; i < 10; i++) {
+      const proposalId = buf.readBigUInt64LE(o); o += 8;
+      const total = buf.readBigUInt64LE(o); o += 8;
+      winners.push({ proposalId, total });
+    }
+    winnersFilled = buf.readUInt8(o); o += 1;
+    schemaVersion = buf.readUInt8(o); o += 1;
+  }
   return {
     id, creator, minBid, feeBps, endTime, creatorPaid, totalStaked,
     proposalCount, winnerProposal, winnerAmount, rentPayer, bump,
+    winnerCount, winners, winnersFilled, schemaVersion,
   };
 }
 
