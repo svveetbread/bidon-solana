@@ -38,7 +38,13 @@ pub async fn new_rpc() -> LightProgramTest {
     LightProgramTest::new(cfg).await.unwrap()
 }
 
+/// Default single-winner setup (winner_count == 1) — preserves legacy behavior.
 pub async fn setup(rpc: &mut LightProgramTest, min_bid: u64) -> Ctx {
+    setup_n(rpc, min_bid, 1).await
+}
+
+/// Setup with a configurable number of winners (top-N).
+pub async fn setup_n(rpc: &mut LightProgramTest, min_bid: u64, winner_count: u8) -> Ctx {
     let payer = rpc.get_payer().insecure_clone();
     let owner = Keypair::new();
     rpc.airdrop_lamports(&owner.pubkey(), 5_000_000_000)
@@ -57,6 +63,7 @@ pub async fn setup(rpc: &mut LightProgramTest, min_bid: u64) -> Ctx {
         Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
     create_auction(
         rpc, &payer, &creator, config_pda, auction_pda, vault_pda, mint, id, min_bid,
+        winner_count,
     )
     .await;
 
@@ -402,8 +409,33 @@ pub async fn create_auction(
     mint: Pubkey,
     id: u64,
     min_bid: u64,
+    winner_count: u8,
 ) {
-    let ix = Instruction {
+    rpc.create_and_send_transaction(
+        &[create_auction_ix(
+            payer, creator, config_pda, auction_pda, vault_pda, mint, id, min_bid, winner_count,
+        )],
+        &payer.pubkey(),
+        &[payer, creator],
+    )
+    .await
+    .unwrap();
+}
+
+/// Build the create_auction instruction (so negative tests can assert validation errors).
+#[allow(clippy::too_many_arguments)]
+pub fn create_auction_ix(
+    payer: &Keypair,
+    creator: &Keypair,
+    config_pda: Pubkey,
+    auction_pda: Pubkey,
+    vault_pda: Pubkey,
+    mint: Pubkey,
+    id: u64,
+    min_bid: u64,
+    winner_count: u8,
+) -> Instruction {
+    Instruction {
         program_id: bidon_zk::ID,
         accounts: bidon_zk::accounts::CreateAuction {
             config: config_pda,
@@ -420,12 +452,10 @@ pub async fn create_auction(
             id,
             min_bid,
             duration_secs: 3600,
+            winner_count,
         }
         .data(),
-    };
-    rpc.create_and_send_transaction(&[ix], &payer.pubkey(), &[payer, creator])
-        .await
-        .unwrap();
+    }
 }
 
 // ---- reads ----
@@ -523,6 +553,20 @@ pub async fn do_withdraw(
     pid: u64,
     current_amount: u64,
 ) {
+    try_withdraw(rpc, ctx, bidder, bidder_token, pid, current_amount)
+        .await
+        .unwrap();
+}
+
+/// Like do_withdraw but returns Ok/Err instead of unwrapping (for rejection assertions).
+pub async fn try_withdraw(
+    rpc: &mut LightProgramTest,
+    ctx: &Ctx,
+    bidder: Pubkey,
+    bidder_token: Pubkey,
+    pid: u64,
+    current_amount: u64,
+) -> std::result::Result<(), ()> {
     let b_addr = bid_address(rpc, ctx.auction_pda, pid, bidder);
     let b_acc = compressed(rpc, b_addr).await;
 
@@ -572,7 +616,8 @@ pub async fn do_withdraw(
     };
     rpc.create_and_send_transaction(&[cu, ix], &ctx.payer.pubkey(), &[&ctx.payer])
         .await
-        .unwrap();
+        .map(|_| ())
+        .map_err(|_| ())
 }
 
 /// close_auction (permissionless GC): close vault + Auction, rent -> relayer (rent_payer).

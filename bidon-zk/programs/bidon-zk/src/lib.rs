@@ -28,6 +28,8 @@ pub const VAULT_SEED: &[u8] = b"vault";
 pub const PROPOSAL_SEED: &[u8] = b"proposal";
 pub const BID_SEED: &[u8] = b"bid";
 pub const MAX_FEE_BPS: u16 = 1000;
+/// Max number of winners (top-N) an auction can have. Bounds the on-chain winners array.
+pub const MAX_WINNERS: usize = 10;
 
 // bidon parimutuel auctions on ZK Compression. Hybrid model:
 //  - Config / Auction / Vault: regular accounts (the hot global leader + the USDC pool).
@@ -75,12 +77,17 @@ pub mod bidon_zk {
         id: u64,
         min_bid: u64,
         duration_secs: i64,
+        winner_count: u8,
     ) -> Result<()> {
         require!(
             id == ctx.accounts.config.auction_count,
             BidonError::InvalidAuctionId
         );
         require!(duration_secs > 0, BidonError::InvalidDuration);
+        require!(
+            winner_count >= 1 && (winner_count as usize) <= MAX_WINNERS,
+            BidonError::InvalidWinnerCount
+        );
 
         let now = Clock::get()?.unix_timestamp;
         let fee_bps = ctx.accounts.config.fee_bps;
@@ -100,6 +107,11 @@ pub mod bidon_zk {
         auction.winner_amount = 0;
         auction.rent_payer = ctx.accounts.payer.key();
         auction.bump = ctx.bumps.auction;
+        // top-N fields
+        auction.winner_count = winner_count;
+        auction.winners = [WinnerSlot::default(); MAX_WINNERS];
+        auction.winners_filled = 0;
+        auction.schema_version = 1;
 
         ctx.accounts.config.auction_count = ctx
             .accounts
@@ -206,7 +218,7 @@ pub mod bidon_zk {
             .total_staked
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
-        auction.update_leader(proposal_id, amount);
+        auction.update_top(proposal_id, amount);
         auction.proposal_count = auction
             .proposal_count
             .checked_add(1)
@@ -277,6 +289,19 @@ pub mod bidon_zk {
             return Err(ProgramError::InvalidAccountData.into());
         }
         let pid_le = proposal_id.to_le_bytes();
+        // Fix #3 (blocker): bind the proposal_id argument to the compressed ProposalTotal
+        // updated via new_mut above. Both proposal & bid addresses live in ADDRESS_TREE_V2
+        // (verified just above). Without this, an attacker raises their own cheap proposal Y
+        // but passes proposal_id = victim X, and update_top(X, total_of_Y) overwrites X's slot.
+        let (expected_proposal_address, _) = derive_address(
+            &[PROPOSAL_SEED, auction_key.as_ref(), pid_le.as_ref()],
+            &address_tree_pubkey,
+            &crate::ID,
+        );
+        require!(
+            proposal_meta.address == expected_proposal_address,
+            BidonError::ProposalIdMismatch
+        );
         let (bid_address, bid_seed) = derive_address(
             &[BID_SEED, auction_key.as_ref(), pid_le.as_ref(), bidder_key.as_ref()],
             &address_tree_pubkey,
@@ -302,7 +327,7 @@ pub mod bidon_zk {
             .total_staked
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
-        auction.update_leader(proposal_id, new_total);
+        auction.update_top(proposal_id, new_total);
 
         Ok(())
     }
@@ -373,12 +398,29 @@ pub mod bidon_zk {
             .with_light_account(bid)?
             .invoke(light_cpi_accounts)?;
 
+        // Fix #3 (blocker): bind the proposal_id argument to the compressed ProposalTotal
+        // updated above. All compressed addresses live in ADDRESS_TREE_V2. Without this, an
+        // attacker tops up their own bid Y but passes proposal_id = victim X, and
+        // update_top(X, ...) would corrupt X's winner slot with an arbitrary total.
+        let auction_key = ctx.accounts.auction.key();
+        let address_tree_pubkey = Pubkey::new_from_array(ADDRESS_TREE_V2);
+        let pid_le = proposal_id.to_le_bytes();
+        let (expected_proposal_address, _) = derive_address(
+            &[PROPOSAL_SEED, auction_key.as_ref(), pid_le.as_ref()],
+            &address_tree_pubkey,
+            &crate::ID,
+        );
+        require!(
+            proposal_meta.address == expected_proposal_address,
+            BidonError::ProposalIdMismatch
+        );
+
         let auction = &mut ctx.accounts.auction;
         auction.total_staked = auction
             .total_staked
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
-        auction.update_leader(proposal_id, new_total);
+        auction.update_top(proposal_id, new_total);
 
         Ok(())
     }
@@ -393,15 +435,39 @@ pub mod bidon_zk {
             BidonError::AuctionNotEnded
         );
         require!(!ctx.accounts.auction.creator_paid, BidonError::AlreadyClaimed);
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here.
+        require!(
+            ctx.accounts.auction.schema_version == 1,
+            BidonError::NotMigrated
+        );
 
-        let winner_amount = ctx.accounts.auction.winner_amount;
+        // Winners pot = Σ of the totals of the occupied top-N slots (NOT legacy winner_amount).
+        // This is the single source of truth; the withdraw gate mirrors the same slice.
+        let filled = ctx.accounts.auction.winners_filled as usize;
+        let mut winners_pot: u64 = 0;
+        for i in 0..filled {
+            winners_pot = winners_pot
+                .checked_add(ctx.accounts.auction.winners[i].total)
+                .ok_or(BidonError::MathOverflow)?;
+        }
+        // Invariant gate: winners_pot can never exceed what was actually staked into the vault.
+        // Turns a would-be permanent SPL "insufficient funds" revert (funds stuck forever) into
+        // an explicit error if the winners array ever desynced from reality.
+        require!(
+            winners_pot <= ctx.accounts.vault.amount,
+            BidonError::InvariantViolation
+        );
+
         let fee_bps = ctx.accounts.auction.fee_bps as u64;
-        let fee = winner_amount
+        // Fee = floor(winners_pot * bps / 10000) computed ONCE on the whole pot (no per-slot
+        // rounding drift). DUST (the division remainder) stays in payout -> goes to the creator,
+        // so payout + fee == winners_pot exactly.
+        let fee = winners_pot
             .checked_mul(fee_bps)
             .ok_or(BidonError::MathOverflow)?
             .checked_div(10_000)
             .ok_or(BidonError::MathOverflow)?;
-        let payout = winner_amount.checked_sub(fee).ok_or(BidonError::MathOverflow)?;
+        let payout = winners_pot.checked_sub(fee).ok_or(BidonError::MathOverflow)?;
 
         let decimals = ctx.accounts.usdc_mint.decimals;
         let id_bytes = ctx.accounts.auction.id.to_le_bytes();
@@ -455,10 +521,23 @@ pub mod bidon_zk {
             now >= ctx.accounts.auction.end_time,
             BidonError::AuctionNotEnded
         );
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here.
         require!(
-            proposal_id != ctx.accounts.auction.winner_proposal,
-            BidonError::WinnerCannotWithdraw
+            ctx.accounts.auction.schema_version == 1,
+            BidonError::NotMigrated
         );
+        // Exact mirror of claim: refunds are forbidden to exactly the pids in winners[0..filled].
+        // The [0..filled] slice excludes default pid=0 tail slots, so a legit proposal_id == 0
+        // is never confused with an empty slot. Same on-chain array both gates read => the
+        // winner/loser partition cannot diverge (array is frozen after end_time).
+        {
+            let auction = &ctx.accounts.auction;
+            let filled = auction.winners_filled as usize;
+            let is_winner = auction.winners[0..filled]
+                .iter()
+                .any(|w| w.proposal_id == proposal_id);
+            require!(!is_winner, BidonError::WinnerCannotWithdraw);
+        }
         require!(
             ctx.accounts.bidder_token.owner == bidder,
             BidonError::Unauthorized
@@ -645,6 +724,14 @@ pub enum BidonError {
     NotSettled,
     #[msg("Auction is not empty (has proposals) — cannot cancel")]
     AuctionNotEmpty,
+    #[msg("winner_count must be between 1 and MAX_WINNERS (10)")]
+    InvalidWinnerCount,
+    #[msg("Auction account not migrated to top-N schema")]
+    NotMigrated,
+    #[msg("Invariant violated: winners_pot exceeds vault balance")]
+    InvariantViolation,
+    #[msg("proposal_id does not match the compressed proposal account")]
+    ProposalIdMismatch,
 }
 
 #[derive(Accounts)]
@@ -924,7 +1011,34 @@ pub struct Config {
     pub bump: u8,
 }
 
-/// Auction (PDA seed "auction" + id LE). The hot global leader is a regular account
+/// One ranked slot of the top-N. Holds (proposal_id, total) so claim knows the amount to
+/// pay and the ordering is fully on-chain and deterministic.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, PartialEq, Eq, Debug,
+)]
+pub struct WinnerSlot {
+    pub proposal_id: u64,
+    pub total: u64,
+}
+
+impl WinnerSlot {
+    /// Total order among seated winners: by total desc, tie-break by proposal_id asc
+    /// (smaller pid ranks higher). The single source of truth for "higher/lower".
+    #[inline]
+    fn ranks_above(&self, other: &WinnerSlot) -> bool {
+        self.total > other.total
+            || (self.total == other.total && self.proposal_id < other.proposal_id)
+    }
+    /// An OUTSIDE candidate evicts an incumbent only on a strictly greater total. On a tie the
+    /// incumbent stays — this makes N==1 byte-identical to the legacy strict-`>` leader and
+    /// raises the bar for last-second frontrun.
+    #[inline]
+    fn strictly_beats(&self, incumbent: &WinnerSlot) -> bool {
+        self.total > incumbent.total
+    }
+}
+
+/// Auction (PDA seed "auction" + id LE). The hot global leader board is a regular account
 /// (native serialization). No `finalized`: all gates are time-based (now >= end_time).
 #[account]
 #[derive(InitSpace)]
@@ -937,21 +1051,84 @@ pub struct Auction {
     pub creator_paid: bool,
     pub total_staked: u64,
     pub proposal_count: u64,
-    /// Leader = proposal_id with the max running total (incremental, strict >).
+    /// DEPRECATED single-winner fields: kept in sync with winners[0] for IDL/back-compat,
+    /// but NEVER read in any money path (claim/withdraw read the winners array instead).
     pub winner_proposal: u64,
     pub winner_amount: u64,
     /// Who fronted rent for Auction+vault (relayer) — refunded on close.
     pub rent_payer: Pubkey,
     pub bump: u8,
+    // ==== top-N fields (strictly at the end; old layout = prefix of new) ====
+    /// N from create_auction, validated 1..=MAX_WINNERS.
+    pub winner_count: u8,
+    /// Sorted by ranks_above (total desc, pid asc). Single source of truth for both gates.
+    pub winners: [WinnerSlot; MAX_WINNERS],
+    /// Occupied slots, <= min(proposal_count, winner_count).
+    pub winners_filled: u8,
+    /// 0 = legacy (not migrated), 1 = top-N. Gates require 1 (fail-closed otherwise).
+    pub schema_version: u8,
 }
 
 impl Auction {
-    /// Update the leader only if a proposal's total strictly exceeds the current max
-    /// (a tie keeps the earlier leader).
-    pub fn update_leader(&mut self, proposal_id: u64, total: u64) {
-        if total > self.winner_amount {
-            self.winner_proposal = proposal_id;
-            self.winner_amount = total;
+    /// Insert/update `proposal_id` with `new_total`, keeping `winners` sorted by ranks_above.
+    /// Replaces update_leader; called from place_bid/raise_bid/top_up_bid after the Light CPI.
+    ///
+    /// PRECONDITION (INV-MONOTONE-TOP): for a given proposal_id, `new_total` is (a) monotonically
+    /// non-decreasing over time and (b) equal to the Light-CPI-verified ProposalTotal.total.
+    /// Guaranteed because update_top runs only AFTER a successful Light CPI and proposal_id is
+    /// bound to that compressed account (the proposal-address rederive in raise/top_up). bubble-up
+    /// is valid ONLY under monotonicity: any future instruction that DECREASES a proposal total
+    /// must re-sort fully, not call update_top.
+    pub fn update_top(&mut self, proposal_id: u64, new_total: u64) {
+        // winner_count is persistent state (could come from migration/old data). Clamp so a
+        // bad 0/>MAX value can never panic on winners[n-1].
+        let n = self.winner_count as usize;
+        let n = if n == 0 || n > MAX_WINNERS { 1 } else { n };
+
+        let incoming = WinnerSlot {
+            proposal_id,
+            total: new_total,
+        };
+        let filled = self.winners_filled as usize;
+
+        // 1. pid already seated -> update total in place, bubble up (total only grows).
+        let mut found: Option<usize> = None;
+        for i in 0..filled {
+            if self.winners[i].proposal_id == proposal_id {
+                found = Some(i);
+                break;
+            }
         }
+        if let Some(mut i) = found {
+            self.winners[i].total = new_total;
+            while i > 0 && self.winners[i].ranks_above(&self.winners[i - 1]) {
+                self.winners.swap(i, i - 1);
+                i -= 1;
+            }
+        } else if filled < n {
+            // 2. free slot -> insert and bubble up.
+            let mut i = filled;
+            self.winners[i] = incoming;
+            self.winners_filled = (filled + 1) as u8;
+            while i > 0 && self.winners[i].ranks_above(&self.winners[i - 1]) {
+                self.winners.swap(i, i - 1);
+                i -= 1;
+            }
+        } else {
+            // 3. full -> evict the bottom ONLY on a strictly greater total (tie keeps incumbent).
+            if incoming.strictly_beats(&self.winners[n - 1]) {
+                let mut i = n - 1;
+                self.winners[i] = incoming;
+                while i > 0 && self.winners[i].ranks_above(&self.winners[i - 1]) {
+                    self.winners.swap(i, i - 1);
+                    i -= 1;
+                }
+            }
+            // else: candidate is outside the top — do nothing.
+        }
+
+        // Keep DEPRECATED legacy fields in sync for external IDL readers (NOT read in gates).
+        self.winner_proposal = self.winners[0].proposal_id;
+        self.winner_amount = self.winners[0].total;
     }
 }

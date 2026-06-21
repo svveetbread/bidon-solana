@@ -123,6 +123,7 @@ async fn test_foundation() {
             id,
             min_bid: 100_000, // 0.1 USDC
             duration_secs: 3600,
+            winner_count: 1,
         }
         .data(),
     };
