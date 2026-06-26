@@ -20,3 +20,17 @@ build.sh
 *.log
 devnet-check.sh
 devnet-setup.sh
+
+# не для ПУБЛИЧНОГО репо — хранится локально (приватная стратегия, бинари, legacy, ассеты)
+/pro-tasks/
+/bidon/
+/clip/
+/.pitchbuild/
+/.claude/
+/.mcp.json
+/skills-lock.json
+/PLAN.md
+/SOLANA_PLAN.md
+/PRODUCT_AND_FRONTEND.md
+/bidon-zk/kora/kora-bin
+bidon-banner*

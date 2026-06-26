@@ -637,3 +637,156 @@ pub async fn do_close_auction(rpc: &mut LightProgramTest, ctx: &Ctx) {
         .await
         .unwrap();
 }
+
+// ======================= audit-fix regression helpers =======================
+
+/// Create an ADDITIONAL auction under the same Config and return a Ctx pointing at it
+/// (shares payer/owner/mint/config with `base`; fresh creator). Used to exercise the
+/// cross-auction binding fix (C-1).
+pub async fn create_extra_auction(
+    rpc: &mut LightProgramTest,
+    base: &Ctx,
+    id: u64,
+    min_bid: u64,
+    winner_count: u8,
+) -> Ctx {
+    let creator = Keypair::new();
+    let (auction_pda, _) =
+        Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
+    create_auction(
+        rpc, &base.payer, &creator, base.config_pda, auction_pda, vault_pda, base.mint, id,
+        min_bid, winner_count,
+    )
+    .await;
+    Ctx {
+        payer: base.payer.insecure_clone(),
+        owner: base.owner.insecure_clone(),
+        creator,
+        mint: base.mint,
+        config_pda: base.config_pda,
+        auction_pda,
+        vault_pda,
+    }
+}
+
+/// Like do_place_bid but returns Ok/Err instead of unwrapping (for rejection assertions, e.g.
+/// the zero-amount guard H-1).
+pub async fn try_place_bid(
+    rpc: &mut LightProgramTest,
+    ctx: &Ctx,
+    bidder: &Keypair,
+    bidder_token: Pubkey,
+    pid: u64,
+    content_hash: [u8; 32],
+    amount: u64,
+) -> std::result::Result<(), ()> {
+    let address_tree = rpc.get_address_tree_v2().tree;
+    let p_addr = proposal_address(rpc, ctx.auction_pda, pid);
+    let b_addr = bid_address(rpc, ctx.auction_pda, pid, bidder.pubkey());
+
+    let mut remaining = PackedAccounts::default();
+    remaining
+        .add_system_accounts_v2(SystemAccountMetaConfig::new(bidon_zk::ID))
+        .unwrap();
+    let rpc_result = rpc
+        .get_validity_proof(
+            vec![],
+            vec![
+                AddressWithTree { tree: address_tree, address: p_addr },
+                AddressWithTree { tree: address_tree, address: b_addr },
+            ],
+            None,
+        )
+        .await
+        .unwrap()
+        .value;
+    let output_state_tree_index = rpc
+        .get_random_state_tree_info()
+        .unwrap()
+        .pack_output_tree_index(&mut remaining)
+        .unwrap();
+    let packed = rpc_result.pack_tree_infos(&mut remaining);
+
+    let data = bidon_zk::instruction::PlaceBid {
+        proof: rpc_result.proof,
+        proposal_address_tree_info: packed.address_trees[0],
+        bid_address_tree_info: packed.address_trees[1],
+        output_state_tree_index,
+        content_hash,
+        amount,
+    }
+    .data();
+    let mut accounts = bid_accounts(ctx, bidder.pubkey(), bidder_token);
+    let (rem, _, _) = remaining.to_account_metas();
+    accounts.extend(rem);
+    let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+    let ix = Instruction { program_id: bidon_zk::ID, accounts, data };
+    rpc.create_and_send_transaction(&[cu, ix], &ctx.payer.pubkey(), &[&ctx.payer, bidder])
+        .await
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+/// withdraw where the instruction ACCOUNTS (auction/vault) may differ from the auction the Bid
+/// was actually staked in. Proves the cross-auction binding fix (C-1): a Bid from `bid_ctx`
+/// presented against `acct_ctx`'s vault must be rejected (ProposalIdMismatch).
+pub async fn try_withdraw_xauction(
+    rpc: &mut LightProgramTest,
+    acct_ctx: &Ctx, // auction/vault used in the instruction accounts (the victim vault)
+    bid_ctx: &Ctx,  // auction the Bid actually belongs to (the attacker's bid)
+    bidder: Pubkey,
+    bidder_token: Pubkey,
+    pid: u64,
+    current_amount: u64,
+) -> std::result::Result<(), ()> {
+    let b_addr = bid_address(rpc, bid_ctx.auction_pda, pid, bidder); // REAL bid in bid_ctx
+    let b_acc = compressed(rpc, b_addr).await;
+
+    let mut remaining = PackedAccounts::default();
+    remaining
+        .add_system_accounts_v2(SystemAccountMetaConfig::new(bidon_zk::ID))
+        .unwrap();
+    let rpc_result = rpc
+        .get_validity_proof(vec![b_acc.hash], vec![], None)
+        .await
+        .unwrap()
+        .value;
+    let packed = rpc_result.pack_tree_infos(&mut remaining);
+    let state = packed.state_trees.unwrap();
+    let bid_meta = CompressedAccountMeta {
+        tree_info: state.packed_tree_infos[0],
+        address: b_acc.address.unwrap(),
+        output_state_tree_index: state.output_tree_index,
+    };
+
+    let data = bidon_zk::instruction::Withdraw {
+        proof: rpc_result.proof,
+        proposal_id: pid,
+        bidder,
+        bid_meta,
+        bid_current_amount: current_amount,
+    }
+    .data();
+    // Accounts point at acct_ctx (the victim auction/vault), NOT bid_ctx.
+    let mut metas = bidon_zk::accounts::Withdraw {
+        config: acct_ctx.config_pda,
+        auction: acct_ctx.auction_pda,
+        vault: acct_ctx.vault_pda,
+        bidder_token,
+        usdc_mint: acct_ctx.mint,
+        payer: acct_ctx.payer.pubkey(),
+        token_program: spl_token::ID,
+    }
+    .to_account_metas(None);
+    let (rem, _, _) = remaining.to_account_metas();
+    metas.extend(rem);
+
+    let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+    let ix = Instruction { program_id: bidon_zk::ID, accounts: metas, data };
+    rpc.create_and_send_transaction(&[cu, ix], &acct_ctx.payer.pubkey(), &[&acct_ctx.payer])
+        .await
+        .map(|_| ())
+        .map_err(|_| ())
+}

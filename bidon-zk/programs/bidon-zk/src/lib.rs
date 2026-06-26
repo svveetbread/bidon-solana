@@ -30,6 +30,14 @@ pub const BID_SEED: &[u8] = b"bid";
 pub const MAX_FEE_BPS: u16 = 1000;
 /// Max number of winners (top-N) an auction can have. Bounds the on-chain winners array.
 pub const MAX_WINNERS: usize = 10;
+/// Max auction duration (365 days). Year-long auctions are a supported product feature; the cap
+/// only blocks ABSURD (decade+/overflow) durations that would lock rent+stakes indefinitely
+/// (audit M-2). Matches the frontend's 365-day max, so any UI-valid duration is on-chain-valid.
+pub const MAX_DURATION_SECS: i64 = 365 * 24 * 60 * 60;
+/// Grace after end_time before an auction may be FORCE-closed (audit M-1). Long enough that any
+/// legit loser has had ample time to withdraw their own refund; after it, residual dust in the
+/// vault is swept to the fee_receiver so the relayer's rent can always be reclaimed.
+pub const CLOSE_GRACE_SECS: i64 = 7 * 24 * 60 * 60;
 
 // bidon parimutuel auctions on ZK Compression. Hybrid model:
 //  - Config / Auction / Vault: regular accounts (the hot global leader + the USDC pool).
@@ -83,7 +91,10 @@ pub mod bidon_zk {
             id == ctx.accounts.config.auction_count,
             BidonError::InvalidAuctionId
         );
-        require!(duration_secs > 0, BidonError::InvalidDuration);
+        require!(
+            duration_secs > 0 && duration_secs <= MAX_DURATION_SECS,
+            BidonError::InvalidDuration
+        );
         require!(
             winner_count >= 1 && (winner_count as usize) <= MAX_WINNERS,
             BidonError::InvalidWinnerCount
@@ -142,6 +153,10 @@ pub mod bidon_zk {
             now < ctx.accounts.auction.end_time,
             BidonError::AuctionEnded
         );
+        // Audit fix (High): reject zero/no-op bids. `InvalidAmount` was defined but never enforced,
+        // so with min_bid == 0 a 0-amount bid was accepted — free relayer-funded compressed-account
+        // spam + winners-array pollution. min_bid alone is not a floor when the creator sets it to 0.
+        require!(amount > 0, BidonError::InvalidAmount);
         require!(
             amount >= ctx.accounts.auction.min_bid,
             BidonError::BelowMinBid
@@ -248,6 +263,10 @@ pub mod bidon_zk {
             now < ctx.accounts.auction.end_time,
             BidonError::AuctionEnded
         );
+        // Audit fix (High): reject zero/no-op bids. `InvalidAmount` was defined but never enforced,
+        // so with min_bid == 0 a 0-amount bid was accepted — free relayer-funded compressed-account
+        // spam + winners-array pollution. min_bid alone is not a floor when the creator sets it to 0.
+        require!(amount > 0, BidonError::InvalidAmount);
         require!(
             amount >= ctx.accounts.auction.min_bid,
             BidonError::BelowMinBid
@@ -352,6 +371,10 @@ pub mod bidon_zk {
             now < ctx.accounts.auction.end_time,
             BidonError::AuctionEnded
         );
+        // Audit fix (High): reject zero/no-op bids. `InvalidAmount` was defined but never enforced,
+        // so with min_bid == 0 a 0-amount bid was accepted — free relayer-funded compressed-account
+        // spam + winners-array pollution. min_bid alone is not a floor when the creator sets it to 0.
+        require!(amount > 0, BidonError::InvalidAmount);
         require!(
             amount >= ctx.accounts.auction.min_bid,
             BidonError::BelowMinBid
@@ -412,6 +435,18 @@ pub mod bidon_zk {
         );
         require!(
             proposal_meta.address == expected_proposal_address,
+            BidonError::ProposalIdMismatch
+        );
+        // Audit fix (defense-in-depth): also bind the Bid to THIS auction (consistency with the
+        // withdraw CRITICAL fix). Benign here (bidder signs, funds their own bid) but keeps the
+        // compressed-account binding uniform across every instruction that touches a Bid.
+        let (expected_bid_address, _) = derive_address(
+            &[BID_SEED, auction_key.as_ref(), pid_le.as_ref(), bidder_key.as_ref()],
+            &address_tree_pubkey,
+            &crate::ID,
+        );
+        require!(
+            bid_meta.address == expected_bid_address,
             BidonError::ProposalIdMismatch
         );
 
@@ -543,6 +578,27 @@ pub mod bidon_zk {
             BidonError::Unauthorized
         );
 
+        // Audit fix (CRITICAL): bind the compressed Bid to THIS auction. The Bid address embeds the
+        // auction key, but withdraw previously trusted only the Light proof — which proves the Bid
+        // leaf is real and program-owned, NOT that it belongs to ctx.accounts.auction. So a Bid
+        // staked into auction A could be redeemed against auction B's vault (cross-auction drain).
+        // raise_bid/top_up_bid already rebind their proposal address; withdraw must rebind the Bid.
+        // Both bid addresses live in ADDRESS_TREE_V2.
+        {
+            let auction_key = ctx.accounts.auction.key();
+            let address_tree_pubkey = Pubkey::new_from_array(ADDRESS_TREE_V2);
+            let pid_le = proposal_id.to_le_bytes();
+            let (expected_bid_address, _) = derive_address(
+                &[BID_SEED, auction_key.as_ref(), pid_le.as_ref(), bidder.as_ref()],
+                &address_tree_pubkey,
+                &crate::ID,
+            );
+            require!(
+                bid_meta.address == expected_bid_address,
+                BidonError::ProposalIdMismatch
+            );
+        }
+
         let decimals = ctx.accounts.usdc_mint.decimals;
         let id_bytes = ctx.accounts.auction.id.to_le_bytes();
         let bump = ctx.accounts.auction.bump;
@@ -635,6 +691,57 @@ pub mod bidon_zk {
             signer_seeds,
         ))?;
 
+        // Auction is closed by Anchor (close = rent_recipient).
+        Ok(())
+    }
+
+    /// Force-close an auction whose vault still holds residual USDC after a long grace period
+    /// (audit M-1). Un-withdrawn loser stakes or any stray/griefing dust donated straight into the
+    /// SPL vault keep `vault.amount != 0` forever, so plain `close_auction` can never run and the
+    /// relayer's rent is locked permanently. After `end_time + CLOSE_GRACE_SECS` and once the
+    /// creator is paid, this sweeps the residual to the fee_receiver and closes the vault + Auction,
+    /// always recovering the relayer's rent. Permissionless GC.
+    pub fn force_close_auction(ctx: Context<ForceCloseAuction>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let grace_end = ctx
+            .accounts
+            .auction
+            .end_time
+            .checked_add(CLOSE_GRACE_SECS)
+            .ok_or(BidonError::MathOverflow)?;
+        require!(now >= grace_end, BidonError::AuctionNotEnded);
+        // Creator must be paid first, so the winners' pot has already left the vault — we only ever
+        // sweep loser-residual + dust to the fee_receiver, never the creator's unclaimed winnings.
+        require!(ctx.accounts.auction.creator_paid, BidonError::NotSettled);
+
+        let id_bytes = ctx.accounts.auction.id.to_le_bytes();
+        let bump = ctx.accounts.auction.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
+
+        let residual = ctx.accounts.vault.amount;
+        if residual > 0 {
+            let decimals = ctx.accounts.usdc_mint.decimals;
+            vault_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.fee_receiver_token,
+                &ctx.accounts.auction,
+                signer_seeds,
+                residual,
+                decimals,
+            )?;
+        }
+        // Vault is now empty -> close it (SPL); rent -> relayer.
+        close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.vault.to_account_info(),
+                destination: ctx.accounts.rent_recipient.to_account_info(),
+                authority: ctx.accounts.auction.to_account_info(),
+            },
+            signer_seeds,
+        ))?;
         // Auction is closed by Anchor (close = rent_recipient).
         Ok(())
     }
@@ -966,6 +1073,42 @@ pub struct CancelAuction<'info> {
     pub vault: Box<Account<'info, TokenAccount>>,
     /// Auction creator — authority (signs), pays NO rent (0 SOL ok; relayer is the fee-payer).
     pub creator: Signer<'info>,
+    /// CHECK: address checked (== auction.rent_payer); receives the vault + Auction rent.
+    #[account(mut, address = auction.rent_payer @ BidonError::Unauthorized)]
+    pub rent_recipient: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+/// Accounts for force_close_auction (audit M-1, permissionless): after end_time + grace, sweep any
+/// residual vault USDC to the fee_receiver, then close vault + Auction; rent -> relayer.
+#[derive(Accounts)]
+pub struct ForceCloseAuction<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(
+        mut,
+        seeds = [AUCTION_SEED, auction.id.to_le_bytes().as_ref()],
+        bump = auction.bump,
+        close = rent_recipient,
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, auction.key().as_ref()],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = auction,
+    )]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(address = config.usdc_mint @ BidonError::InvalidMint)]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+    /// Sink for residual dust — must be the configured fee_receiver's USDC token account.
+    #[account(
+        mut,
+        constraint = fee_receiver_token.owner == config.fee_receiver @ BidonError::Unauthorized,
+        constraint = fee_receiver_token.mint == config.usdc_mint @ BidonError::InvalidMint,
+    )]
+    pub fee_receiver_token: Box<Account<'info, TokenAccount>>,
     /// CHECK: address checked (== auction.rent_payer); receives the vault + Auction rent.
     #[account(mut, address = auction.rent_payer @ BidonError::Unauthorized)]
     pub rent_recipient: UncheckedAccount<'info>,
