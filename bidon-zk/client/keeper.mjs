@@ -129,8 +129,10 @@ async function resolveAuction(cfg, a) {
   // 2) возврат каждому проигравшему (бидеры из ленты)
   const bidders = await feedBidders(id.toString());
   let allRefunded = true;
+  let attempted = 0; // сколько лузеров реально пытались вернуть (для различения «feed пуст» vs «есть остаток»)
   for (const { pid, bidder } of bidders) {
     if (winnerPids.has(pid.toString())) continue; // победный лот — не возвращаем (ушёл автору)
+    attempted++;
     try {
       const bidderPk = new PublicKey(bidder);
       const bidderToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, bidderPk)).address;
@@ -154,7 +156,24 @@ async function resolveAuction(cfg, a) {
     }
   }
 
-  // готов = победителю выплачено И легит-возвраты прошли без транзиентных ошибок → больше не трогаем
+  // он-чейн-сверка перед done (H4/M2 аудита): пока в волте лежит USDC — расчёты НЕ закончены, не верим
+  // только feed'у. Различаем сбой стора (feed дал 0 лузеров, а деньги есть → ретрай) и реальный остаток
+  // (лузеры не из feed → логируем и закрываем, иначе крутили бы впустую; они заберут сами, permissionless).
+  let vaultRemaining = -1n;
+  try {
+    vaultRemaining = BigInt((await conn.getTokenAccountBalance(vault)).value.amount);
+  } catch (e) {
+    if (isTransient(e.message)) return { done: false }; // не смогли проверить баланс → перепроверим в след. тик
+  }
+  if (vaultRemaining > 0n && attempted === 0) {
+    console.log(`[#${id}] vault=${vaultRemaining}, но feed дал 0 лузеров → ретрай (возможен сбой стора)`);
+    return { done: false };
+  }
+  if (vaultRemaining > 0n) {
+    console.warn(`[#${id}] ⚠ остаток ${vaultRemaining} в волте после возвратов — лузеры не из feed; заберут сами (withdraw permissionless)`);
+  }
+
+  // готов = победителю выплачено, легит-возвраты прошли, и vault проверен он-чейн → больше не трогаем
   return { done: paid && allRefunded };
 }
 
