@@ -8,6 +8,8 @@
 import './load-env.mjs';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount } from '@solana/spl-token';
+import bs58 from 'bs58';
+import { createPrivateKey, sign as edSign } from 'crypto';
 import {
   RPC_URL, HELIUS_RPC, configPda, auctionPda, vaultPda,
   ixClaimWinnings, ixCloseAuction, decodeConfig, decodeAuction,
@@ -21,7 +23,6 @@ const ONCE = process.argv.includes('--once');
 
 let relayer;
 if (process.env.KORA_PRIVATE_KEY) {
-  const bs58 = (await import('bs58')).default;
   relayer = Keypair.fromSecretKey(bs58.decode(process.env.KORA_PRIVATE_KEY));
 } else {
   relayer = loadKeypair(process.env.RELAYER_KEYPAIR || './.relayer.json');
@@ -29,6 +30,48 @@ if (process.env.KORA_PRIVATE_KEY) {
 
 const conn = connection();
 const lrpc = lightRpc(HELIUS_RPC);
+
+// id-ы полностью отрезолвленных аукционов — пропускаем БЕЗ единого RPC (не гоняем keeper по всей истории).
+const doneAuctions = new Set();
+// transient (429/сеть) → ретраим; всё прочее («уже сделано» / программный отказ) → считаем выполненным.
+const isTransient = (m) =>
+  /429|too many|timeout|timed out|fetch failed|econn|etimedout|rate limit|socket hang|getaddrinfo|network/i.test(m || "");
+
+// Персистентный кэш отрезолвленных аукционов в сторе → keeper НЕ пересканирует историю после рестарта.
+async function loadResolved() {
+  try {
+    const r = await fetch(`${STORE_URL}/resolved`);
+    if (!r.ok) return;
+    for (const id of await r.json()) doneAuctions.add(Number(id));
+    console.log(`загружено отрезолвленных из стора: ${doneAuctions.size}`);
+  } catch {
+    /* стор недоступен — деградируем до in-memory */
+  }
+}
+// ed25519-подпись через node:crypto (без внешних зависимостей; ed25519-seed = первые 32 байта secretKey).
+const PKCS8_ED = Buffer.from("302e020100300506032b657004220420", "hex");
+const signEd = (msgBytes) =>
+  edSign(null, Buffer.from(msgBytes), createPrivateKey({
+    key: Buffer.concat([PKCS8_ED, Buffer.from(relayer.secretKey.slice(0, 32))]),
+    format: "der",
+    type: "pkcs8",
+  }));
+async function markResolvedInStore(id) {
+  try {
+    const sig = bs58.encode(signEd(new TextEncoder().encode(`bidon-resolved:${id}`)));
+    await fetch(`${STORE_URL}/resolved`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auctionId: id.toString(), sig }),
+    });
+  } catch {
+    /* best-effort — на след. тике/рестарте перезапишется */
+  }
+}
+const markDone = (id) => {
+  doneAuctions.add(id);
+  void markResolvedInStore(id);
+};
 
 /** Уникальные (proposalId, bidder) ставки аукциона из персистентной ленты стора. */
 async function feedBidders(auctionId) {
@@ -59,18 +102,24 @@ async function resolveAuction(cfg, a) {
     a.winners.slice(0, a.winnersFilled).filter((w) => w.total > 0n).map((w) => w.proposalId.toString()),
   );
 
-  // 1) выплата победителю (idempotent — повторный вызов упадёт, ловим)
-  try {
-    const creatorToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, a.creator)).address;
-    const feeReceiverToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, cfg.feeReceiver)).address;
-    await sendIx(conn, ixClaimWinnings({ id, vault, creatorToken, feeReceiverToken, usdcMint: cfg.usdcMint }), relayer, [], `claim`);
-    console.log(`[#${id}] ✓ выплата победителю`);
-  } catch (e) {
-    if (!/already|insufficient|0x|custom/i.test(e.message || '')) console.log(`[#${id}] claim skip: ${e.message}`);
+  // 1) выплата победителю — пропускаем, если creator_paid уже true (читаем с чейна)
+  let paid = a.creatorPaid === true;
+  if (!paid) {
+    try {
+      const creatorToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, a.creator)).address;
+      const feeReceiverToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, cfg.feeReceiver)).address;
+      await sendIx(conn, ixClaimWinnings({ id, vault, creatorToken, feeReceiverToken, usdcMint: cfg.usdcMint }), relayer, [], `claim`);
+      console.log(`[#${id}] ✓ выплата победителю`);
+      paid = true;
+    } catch (e) {
+      if (isTransient(e.message)) console.log(`[#${id}] claim retry: ${e.message}`);
+      else paid = true; // already paid / программный отказ — считаем сделанным
+    }
   }
 
   // 2) возврат каждому проигравшему (бидеры из ленты)
   const bidders = await feedBidders(id.toString());
+  let allRefunded = true;
   for (const { pid, bidder } of bidders) {
     if (winnerPids.has(pid.toString())) continue; // победный лот — не возвращаем (ушёл автору)
     try {
@@ -80,7 +129,7 @@ async function resolveAuction(cfg, a) {
       await sendIx(conn, [cuLimit(400_000), wd.ix], relayer, [], `withdraw`);
       console.log(`[#${id}] ✓ возврат pid${pid} ${bidder.slice(0, 8)}…`);
     } catch (e) {
-      // ставка уже возвращена / Bid не найден / гонка proof — пропускаем, ретрай в след. цикле
+      if (isTransient(e.message)) allRefunded = false; // ретрай в след. цикле; иначе уже возвращено / Bid нет
     }
   }
 
@@ -95,6 +144,9 @@ async function resolveAuction(cfg, a) {
       /* ещё не готов (остались возвраты) — следующий цикл */
     }
   }
+
+  // готов = победителю выплачено И легит-возвраты прошли без транзиентных ошибок → больше не трогаем
+  return { done: paid && allRefunded };
 }
 
 async function tick() {
@@ -104,23 +156,26 @@ async function tick() {
     const cfg = decodeConfig(cfgInfo.data);
     const now = Math.floor(Date.now() / 1000);
     const count = Number(cfg.auctionCount);
-    let processed = 0;
+    let processed = 0, active = 0;
     for (let id = 0; id < count; id++) {
+      if (doneAuctions.has(id)) continue; // уже отрезолвлен → ни одного RPC
       const info = await conn.getAccountInfo(auctionPda(BigInt(id)));
-      if (!info) continue; // закрыт/не существует
+      if (!info) { markDone(id); continue; } // закрыт/не существует → done
       const a = decodeAuction(info.data);
-      if (Number(a.endTime) > now) continue; // ещё идёт
-      if (a.schemaVersion !== 1) continue; // старый (заморожен, до winner_count) — гейты fail-closed
-      await resolveAuction(cfg, a);
+      if (Number(a.endTime) > now) { active++; continue; } // ещё идёт — перепроверим в след. тик
+      if (a.schemaVersion !== 1) { markDone(id); continue; } // legacy (заморожен) → done
+      const { done } = await resolveAuction(cfg, a);
       processed++;
+      if (done) markDone(id);
     }
-    console.log(`tick: обработано ${processed} завершённых (из ${count})`);
+    console.log(`tick: к-резолву ${processed}, активных ${active}, пропущено ${doneAuctions.size}/${count}`);
   } catch (e) {
     console.error('tick error:', e.message);
   }
 }
 
 console.log(`bidon keeper · RPC=${RPC_URL} · store=${STORE_URL} · relayer=${relayer.publicKey.toBase58()} · ${ONCE ? 'once' : `loop ${INTERVAL_MS}ms`}`);
+await loadResolved();
 await tick();
 if (!ONCE) {
   setInterval(() => void tick(), INTERVAL_MS);
