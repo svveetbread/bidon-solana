@@ -33,9 +33,13 @@ const lrpc = lightRpc(HELIUS_RPC);
 
 // id-ы полностью отрезолвленных аукционов — пропускаем БЕЗ единого RPC (не гоняем keeper по всей истории).
 const doneAuctions = new Set();
-// transient (429/сеть) → ретраим; всё прочее («уже сделано» / программный отказ) → считаем выполненным.
+// transient (сеть/RPC/подтверждение) → ретраим. ВАЖНО: список широкий — обычные devnet-сбои
+// (blockhash not found, block height exceeded, node is behind, not confirmed, 502/503) НЕ должны
+// приниматься за «готово», иначе транзиентная ошибка бросает аук навсегда (см. баг с #53).
 const isTransient = (m) =>
-  /429|too many|timeout|timed out|fetch failed|econn|etimedout|rate limit|socket hang|getaddrinfo|network/i.test(m || "");
+  /429|too many|rate.?limit|timeout|timed out|fetch failed|failed to fetch|econn|etimedout|eai_again|getaddrinfo|socket hang|network|blockhash not found|block ?height ?exceeded|node is behind|not confirmed|unable to confirm|expired|50[234]|gateway|service unavailable|connection (reset|closed|refused|terminated)/i.test(
+    m || "",
+  );
 
 // Персистентный кэш отрезолвленных аукционов в сторе → keeper НЕ пересканирует историю после рестарта.
 async function loadResolved() {
@@ -101,9 +105,13 @@ async function resolveAuction(cfg, a) {
   const winnerPids = new Set(
     a.winners.slice(0, a.winnersFilled).filter((w) => w.total > 0n).map((w) => w.proposalId.toString()),
   );
+  // есть ли вообще победный пул (кому делать creator-выплату). Нет ставок → платить некому → шаг выполнен.
+  const hasWinner = a.winners.slice(0, a.winnersFilled).some((w) => w.total > 0n);
 
-  // 1) выплата победителю — пропускаем, если creator_paid уже true (читаем с чейна)
-  let paid = a.creatorPaid === true;
+  // 1) выплата победителю. Источник истины — on-chain creator_paid, НЕ текст ошибки.
+  //    НИКОГДА не помечаем «выплачено» вслепую: при любом сбое перечитываем флаг с чейна
+  //    (tx могла пройти, но отвалиться на подтверждении) — иначе транзиент бросает аук навсегда.
+  let paid = a.creatorPaid === true || !hasWinner;
   if (!paid) {
     try {
       const creatorToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, a.creator)).address;
@@ -112,8 +120,9 @@ async function resolveAuction(cfg, a) {
       console.log(`[#${id}] ✓ выплата победителю`);
       paid = true;
     } catch (e) {
-      if (isTransient(e.message)) console.log(`[#${id}] claim retry: ${e.message}`);
-      else paid = true; // already paid / программный отказ — считаем сделанным
+      const fresh = await conn.getAccountInfo(auction).catch(() => null); // перечитать флаг с чейна
+      paid = fresh ? decodeAuction(fresh.data).creatorPaid === true : false;
+      if (!paid) console.log(`[#${id}] claim retry: ${e.message}`);
     }
   }
 
