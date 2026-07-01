@@ -22,6 +22,7 @@ anchor-lang = "0.31.1"
 anchor-spl = "0.31.1"
 light-hasher = "5.0.0"
 light-sdk = { version = "0.23.0", features = ["anchor", "cpi-context"] }
+solana-security-txt = "1.1.1"
 
 [dev-dependencies]
 anchor-spl = "0.31.1"

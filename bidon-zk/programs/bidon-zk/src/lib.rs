@@ -21,6 +21,19 @@ declare_id!("4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz");
 pub const LIGHT_CPI_SIGNER: CpiSigner =
     derive_light_cpi_signer!("4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz");
 
+// On-chain security.txt (аудит #3): контакт для white-hat раскрытия — эксплореры (Solana Explorer,
+// SolanaFM) показывают его на странице программы. Логику не меняет, только метаданные в бинаре.
+#[cfg(not(feature = "no-entrypoint"))]
+solana_security_txt::security_txt! {
+    name: "bidon",
+    project_url: "https://bidon.live",
+    contacts: "link:https://github.com/svveetbread/bidon-solana/security/advisories/new",
+    policy: "https://github.com/svveetbread/bidon-solana/blob/main/SECURITY.md",
+    source_code: "https://github.com/svveetbread/bidon-solana",
+    preferred_languages: "en,ru",
+    auditors: "Internal review (bidon-zk/AUDIT.md); external audit pending pre-mainnet"
+}
+
 // ---- regular-account seeds & limits (Config / Auction / Vault) ----
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const AUCTION_SEED: &[u8] = b"auction";
