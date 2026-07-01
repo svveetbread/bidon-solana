@@ -193,9 +193,15 @@ export function connection() {
   return new Connection(RPC_URL, 'confirmed');
 }
 export const cuLimit = (n) => ComputeBudgetProgram.setComputeUnitLimit({ units: n });
+export const cuPrice = (microLamports) => ComputeBudgetProgram.setComputeUnitPrice({ microLamports });
+// Priority fee для keeper-tx (аудит H4: без него крэнк проигрывает блокспейс под конгестией/спамом).
+// µlamports/CU; при 400k CU и 20000 → ~8000 lamports ≈ 0.000008 SOL/tx. Настраивается KEEPER_PRIORITY_FEE.
+const PRIORITY_FEE = Number(process.env.KEEPER_PRIORITY_FEE ?? 20000);
 
 export async function sendIx(conn, ixs, payer, signers, label = 'tx') {
-  const tx = new Transaction().add(...(Array.isArray(ixs) ? ixs : [ixs]));
+  const list = Array.isArray(ixs) ? ixs : [ixs];
+  // priority-fee первой инструкцией (если не задан 0). Дубля setComputeUnitPrice у наших вызовов нет.
+  const tx = new Transaction().add(...(PRIORITY_FEE > 0 ? [cuPrice(PRIORITY_FEE)] : []), ...list);
   const sig = await sendAndConfirmTransaction(conn, tx, [payer, ...signers], {
     commitment: 'confirmed', skipPreflight: false,
   });
