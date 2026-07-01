@@ -731,21 +731,14 @@ pub mod bidon_zk {
         let bump = ctx.accounts.auction.bump;
         let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
 
-        let residual = ctx.accounts.vault.amount;
-        if residual > 0 {
-            let decimals = ctx.accounts.usdc_mint.decimals;
-            vault_transfer(
-                &ctx.accounts.token_program,
-                &ctx.accounts.vault,
-                &ctx.accounts.usdc_mint,
-                &ctx.accounts.fee_receiver_token,
-                &ctx.accounts.auction,
-                signer_seeds,
-                residual,
-                decimals,
-            )?;
-        }
-        // Vault is now empty -> close it (SPL); rent -> relayer.
+        // АУДИТ H1: БОЛЬШЕ НЕ выметаем остаток проигравших платформе — это была потеря средств юзеров и
+        // нарушение обещания «возврат без дедлайна». force_close теперь закрывает ТОЛЬКО пустой волт;
+        // при любом остатке намеренно падает, а проигравшие забирают своё сами (withdraw permissionless,
+        // без дедлайна). Рента брошенного аука остаётся залочена (мелочь релейера) — приемлемая цена за
+        // сохранность средств юзеров. fee_receiver_token в контексте больше не используется (оставлен для
+        // совместимости дискриминатора/IDL).
+        require!(ctx.accounts.vault.amount == 0, BidonError::NotSettled);
+        // Vault is empty -> close it (SPL); rent -> relayer.
         close_account(CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             CloseAccount {
