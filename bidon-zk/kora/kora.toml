@@ -45,10 +45,13 @@ token = "5buueP7zgapsJrraPATUpSE2c7hLc35GhkKWwM2GFPyY"
 strict = false
 
 # Kora inspects CPI too, so the fee payer must be explicitly allowed to create accounts
-# (create_auction inits Auction + Vault, rent paid by Kora) and to do System Transfer
-# (Light CPI network fee). nonce/spl_token/token_2022 stay default (false).
+# (create_auction inits Auction + Vault, rent paid by Kora). allow_transfer=FALSE (аудит C2):
+# запрещаем System Transfer с источником = ключ релейера → нельзя заставить релеер подписать слив
+# своего SOL атакующему. Light-комиссию собирает сама Light System программа, а не голый transfer
+# с релеера-источника, поэтому place_bid/create_auction это НЕ ломает (проверено тестовой ставкой).
+# nonce/spl_token/token_2022 stay default (false).
 [validation.fee_payer_policy.system]
-allow_transfer = true
+allow_transfer = false
 allow_assign = false
 allow_create_account = true
 allow_allocate = false
