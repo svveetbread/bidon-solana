@@ -40,7 +40,17 @@ pub const AUCTION_SEED: &[u8] = b"auction";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const PROPOSAL_SEED: &[u8] = b"proposal";
 pub const BID_SEED: &[u8] = b"bid";
+/// Компаньон-аккаунт антиснайпа (аудит §7): хранит потолок продления. Отдельный аккаунт (как
+/// ListingConfig у Metaplex Auctioneer) — чтобы НЕ менять layout Auction (иначе старые ауки нечитаемы).
+pub const AUCTION_EXT_SEED: &[u8] = b"auction_ext";
 pub const MAX_FEE_BPS: u16 = 1000;
+/// Антиснайп: окно перед концом, в котором смена набора победителей продлевает аукцион, и величина
+/// продления (кладём равными). Продлеваем до потолка создателя. 120с = реалистичное время «увидел +
+/// поставил газлесс-ставку ~8с». Меньше — защита фиктивна (человек не успеет ответить).
+pub const ANTISNIPE_WINDOW_SECS: i64 = 120;
+/// Границы потолка суммарного продления, задаваемого создателем (1 минута .. 1 час).
+pub const MIN_ANTISNIPE_CAP_SECS: i64 = 60;
+pub const MAX_ANTISNIPE_CAP_SECS: i64 = 60 * 60;
 /// Max number of winners (top-N) an auction can have. Bounds the on-chain winners array.
 pub const MAX_WINNERS: usize = 10;
 /// Max auction duration (365 days). Year-long auctions are a supported product feature; the cap
@@ -1218,6 +1228,19 @@ pub struct Auction {
     pub schema_version: u8,
 }
 
+/// Компаньон Auction для антиснайпа (аудит §7). Отдельный аккаунт (PDA seed "auction_ext" + id LE),
+/// создаётся в create_auction ТОЛЬКО для новых ауков. Старые ауки его не имеют → антиснайп для них
+/// выключен (обратная совместимость, без миграции layout Auction). Хранит лишь жёсткий потолок конца.
+#[account]
+#[derive(InitSpace)]
+pub struct AuctionExt {
+    pub id: u64,
+    /// Абсолютный потолок end_time = (end_time при создании) + max_extension создателя. Продление
+    /// НИКОГДА не двигает end_time дальше этого значения.
+    pub max_end_time: i64,
+    pub bump: u8,
+}
+
 impl Auction {
     /// Insert/update `proposal_id` with `new_total`, keeping `winners` sorted by ranks_above.
     /// Replaces update_leader; called from place_bid/raise_bid/top_up_bid after the Light CPI.
@@ -1228,7 +1251,9 @@ impl Auction {
     /// bound to that compressed account (the proposal-address rederive in raise/top_up). bubble-up
     /// is valid ONLY under monotonicity: any future instruction that DECREASES a proposal total
     /// must re-sort fully, not call update_top.
-    pub fn update_top(&mut self, proposal_id: u64, new_total: u64) {
+    /// Возвращает true, если СМЕНИЛСЯ НАБОР победителей (топ-N): кто-то вошёл в пул / кого-то вытеснили.
+    /// Реордер внутри пула (те же участники) НЕ считается сменой набора. Используется антиснайпом.
+    pub fn update_top(&mut self, proposal_id: u64, new_total: u64) -> bool {
         // winner_count is persistent state (could come from migration/old data). Clamp so a
         // bad 0/>MAX value can never panic on winners[n-1].
         let n = self.winner_count as usize;
@@ -1239,6 +1264,7 @@ impl Auction {
             total: new_total,
         };
         let filled = self.winners_filled as usize;
+        let mut set_changed = false; // сменился ли НАБОР победителей (вход/вытеснение) — триггер антиснайпа
 
         // 1. pid already seated -> update total in place, bubble up (total only grows).
         let mut found: Option<usize> = None;
@@ -1255,7 +1281,8 @@ impl Auction {
                 i -= 1;
             }
         } else if filled < n {
-            // 2. free slot -> insert and bubble up.
+            // 2. free slot -> insert and bubble up. Новый участник вошёл в пул -> набор сменился.
+            set_changed = true;
             let mut i = filled;
             self.winners[i] = incoming;
             self.winners_filled = (filled + 1) as u8;
@@ -1266,6 +1293,8 @@ impl Auction {
         } else {
             // 3. full -> evict the bottom ONLY on a strictly greater total (tie keeps incumbent).
             if incoming.strictly_beats(&self.winners[n - 1]) {
+                // кого-то ВЫТЕСНИЛИ из пула, incoming вошёл -> набор сменился (триггер антиснайпа).
+                set_changed = true;
                 let mut i = n - 1;
                 self.winners[i] = incoming;
                 while i > 0 && self.winners[i].ranks_above(&self.winners[i - 1]) {
@@ -1279,5 +1308,7 @@ impl Auction {
         // Keep DEPRECATED legacy fields in sync for external IDL readers (NOT read in gates).
         self.winner_proposal = self.winners[0].proposal_id;
         self.winner_amount = self.winners[0].total;
+
+        set_changed
     }
 }
