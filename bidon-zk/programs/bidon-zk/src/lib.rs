@@ -109,6 +109,8 @@ pub mod bidon_zk {
         min_bid: u64,
         duration_secs: i64,
         winner_count: u8,
+        // Антиснайп (§7): потолок СУММАРНОГО продления, задаёт создатель (60..3600с).
+        max_extension_secs: i64,
     ) -> Result<()> {
         require!(
             id == ctx.accounts.config.auction_count,
@@ -121,6 +123,11 @@ pub mod bidon_zk {
         require!(
             winner_count >= 1 && (winner_count as usize) <= MAX_WINNERS,
             BidonError::InvalidWinnerCount
+        );
+        require!(
+            max_extension_secs >= MIN_ANTISNIPE_CAP_SECS
+                && max_extension_secs <= MAX_ANTISNIPE_CAP_SECS,
+            BidonError::InvalidAntisnipeCap
         );
 
         let now = Clock::get()?.unix_timestamp;
@@ -146,6 +153,15 @@ pub mod bidon_zk {
         auction.winners = [WinnerSlot::default(); MAX_WINNERS];
         auction.winners_filled = 0;
         auction.schema_version = 1;
+        let end_time = auction.end_time; // последнее использование auction перед ext (NLL освобождает borrow)
+
+        // Компаньон антиснайпа: потолок = конец при создании + заданное создателем макс. продление.
+        let ext = &mut ctx.accounts.auction_ext;
+        ext.id = id;
+        ext.max_end_time = end_time
+            .checked_add(max_extension_secs)
+            .ok_or(BidonError::MathOverflow)?;
+        ext.bump = ctx.bumps.auction_ext;
 
         ctx.accounts.config.auction_count = ctx
             .accounts
@@ -256,7 +272,11 @@ pub mod bidon_zk {
             .total_staked
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
-        auction.update_top(proposal_id, amount);
+        // антиснайп (§7): смена набора победителей у нового аука (есть компаньон) в финальном окне
+        // продлевает end_time. cap = None (старый аук без компаньона) → продления нет.
+        let set_changed = auction.update_top(proposal_id, amount);
+        let cap = ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time);
+        extend_if_sniped(&mut auction.end_time, cap, set_changed)?;
         auction.proposal_count = auction
             .proposal_count
             .checked_add(1)
@@ -369,7 +389,9 @@ pub mod bidon_zk {
             .total_staked
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
-        auction.update_top(proposal_id, new_total);
+        let set_changed = auction.update_top(proposal_id, new_total);
+        let cap = ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time);
+        extend_if_sniped(&mut auction.end_time, cap, set_changed)?; // антиснайп §7
 
         Ok(())
     }
@@ -478,7 +500,9 @@ pub mod bidon_zk {
             .total_staked
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
-        auction.update_top(proposal_id, new_total);
+        let set_changed = auction.update_top(proposal_id, new_total);
+        let cap = ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time);
+        extend_if_sniped(&mut auction.end_time, cap, set_changed)?; // антиснайп §7
 
         Ok(())
     }
@@ -849,6 +873,8 @@ pub enum BidonError {
     AuctionNotEmpty,
     #[msg("winner_count must be between 1 and MAX_WINNERS (10)")]
     InvalidWinnerCount,
+    #[msg("anti-snipe cap must be between 60 and 3600 seconds")]
+    InvalidAntisnipeCap,
     #[msg("Auction account not migrated to top-N schema")]
     NotMigrated,
     #[msg("Invariant violated: winners_pot exceeds vault balance")]
@@ -910,6 +936,16 @@ pub struct CreateAuction<'info> {
         token::authority = auction,
     )]
     pub vault: Account<'info, TokenAccount>,
+    /// Компаньон антиснайпа (§7): хранит потолок продления. Рента с payer (как Auction/vault),
+    /// возвращается... остаётся с аукционом (маленький аккаунт, ~ренты). seeds = "auction_ext" + id.
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + AuctionExt::INIT_SPACE,
+        seeds = [AUCTION_EXT_SEED, id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub auction_ext: Account<'info, AuctionExt>,
     /// Auction creator — authority (signs), pays NO rent.
     pub creator: Signer<'info>,
     /// Rent + tx-fee payer (relayer/gasless). Rent refunded to it on close.
@@ -949,6 +985,10 @@ pub struct PlaceBid<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     pub token_program: Program<'info, Token>,
+    /// Компаньон антиснайпа (§7), ОПЦИОНАЛЕН: у новых ауков есть (продление активно), у старых нет
+    /// (None → продления нет, обратная совместимость). seeds привязывают его к этому ауку.
+    #[account(seeds = [AUCTION_EXT_SEED, auction.id.to_le_bytes().as_ref()], bump)]
+    pub auction_ext: Option<Account<'info, AuctionExt>>,
 }
 
 /// Accounts for raise_bid / top_up_bid (same shape as PlaceBid). Compressed accounts
@@ -979,6 +1019,9 @@ pub struct RaiseBid<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     pub token_program: Program<'info, Token>,
+    /// Компаньон антиснайпа (§7), ОПЦИОНАЛЕН (см. PlaceBid). Общий контекст raise_bid + top_up_bid.
+    #[account(seeds = [AUCTION_EXT_SEED, auction.id.to_le_bytes().as_ref()], bump)]
+    pub auction_ext: Option<Account<'info, AuctionExt>>,
 }
 
 /// Accounts for claim_winnings (regular accounts only; vault drained via PDA signature).
@@ -1239,6 +1282,25 @@ pub struct AuctionExt {
     /// НИКОГДА не двигает end_time дальше этого значения.
     pub max_end_time: i64,
     pub bump: u8,
+}
+
+/// Антиснайп (§7): если ставка сменила НАБОР победителей (`set_changed`) и до конца осталось меньше
+/// окна — двигаем `end_time` так, чтобы осталось ~окно, но не дальше потолка `cap`. `cap = None`
+/// (старый аук без компаньона) → продления нет. Реализация как process_time_extension у Metaplex
+/// Auctioneer, но (1) триггер = смена топ-N, а не любая ставка, и (2) с жёстким потолком.
+fn extend_if_sniped(end_time: &mut i64, cap: Option<i64>, set_changed: bool) -> Result<()> {
+    if set_changed {
+        if let Some(cap) = cap {
+            let now = Clock::get()?.unix_timestamp;
+            let want = now
+                .checked_add(ANTISNIPE_WINDOW_SECS)
+                .ok_or(BidonError::MathOverflow)?;
+            if want > *end_time {
+                *end_time = want.min(cap);
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Auction {
