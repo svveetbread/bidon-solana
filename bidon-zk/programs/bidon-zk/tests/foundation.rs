@@ -106,6 +106,8 @@ async fn test_foundation() {
         Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
     let (vault_pda, _) =
         Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
+    let (auction_ext_pda, _) =
+        Pubkey::find_program_address(&[b"auction_ext", &id.to_le_bytes()], &bidon_zk::ID); // §7 компаньон
     let ix = Instruction {
         program_id: bidon_zk::ID,
         accounts: bidon_zk::accounts::CreateAuction {
@@ -113,6 +115,7 @@ async fn test_foundation() {
             auction: auction_pda,
             usdc_mint: mint.pubkey(),
             vault: vault_pda,
+            auction_ext: auction_ext_pda,
             creator: creator.pubkey(),
             payer: payer.pubkey(),
             token_program: spl_token::ID,
@@ -124,6 +127,7 @@ async fn test_foundation() {
             min_bid: 100_000, // 0.1 USDC
             duration_secs: 3600,
             winner_count: 1,
+            max_extension_secs: 600, // §7 антиснайп (в границах 60..3600)
         }
         .data(),
     };

@@ -3,6 +3,8 @@
 //!  - C-1 (Critical): withdraw must reject a Bid that belongs to a DIFFERENT auction
 //!    (cross-auction vault drain).
 //!  - H-1 (High): zero-amount bids must be rejected even when min_bid == 0.
+//!  - N-2 (round 2): on a v2 anti-snipe auction, every bid MUST supply the AuctionExt companion —
+//!    omitting the optional account (to silently disable the end_time extension) is rejected.
 
 mod common;
 use common::*;
@@ -69,4 +71,29 @@ async fn test_reject_zero_amount_bid() {
     let ok = try_place_bid(&mut rpc, &ctx, &bidder, token, 0, C0, 1).await;
     assert!(ok.is_ok(), "positive bid should succeed");
     assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 1);
+}
+
+/// N-2: on a v2 (anti-snipe) auction the AuctionExt companion is MANDATORY on every bid. Omitting it
+/// (passing the program-id `None` sentinel) previously let a sniper silently disable the end_time
+/// extension and take the final slot uncontested. The bid must now revert (AntisnipeExtRequired), with
+/// no funds moved; supplying the companion succeeds.
+#[tokio::test]
+async fn test_bid_without_antisnipe_ext_rejected() {
+    let mut rpc = new_rpc().await;
+    let ctx = setup(&mut rpc, MIN_BID).await; // fresh auction → anti-snipe schema (v2)
+
+    // Sanity: new auctions are created on the anti-snipe schema (2).
+    assert_eq!(get_auction(&mut rpc, ctx.auction_pda).await.schema_version, 2);
+
+    let (bidder, token) = funded_bidder(&mut rpc, &ctx, 1_000_000).await;
+
+    // ATTACK: place_bid WITHOUT the companion must be rejected; the vault stays empty (atomic revert).
+    let no_ext = try_place_bid_without_ext(&mut rpc, &ctx, &bidder, token, 0, C0, 300_000).await;
+    assert!(no_ext.is_err(), "bid without AuctionExt MUST be rejected on a v2 auction (N-2)");
+    assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 0, "no funds moved on reverted bid");
+
+    // CONTROL: the same bid WITH the companion succeeds.
+    let with_ext = try_place_bid(&mut rpc, &ctx, &bidder, token, 0, C0, 300_000).await;
+    assert!(with_ext.is_ok(), "bid with AuctionExt should succeed");
+    assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 300_000);
 }

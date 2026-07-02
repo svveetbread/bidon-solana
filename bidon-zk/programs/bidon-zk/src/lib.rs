@@ -61,6 +61,12 @@ pub const MAX_DURATION_SECS: i64 = 365 * 24 * 60 * 60;
 /// legit loser has had ample time to withdraw their own refund; after it, residual dust in the
 /// vault is swept to the fee_receiver so the relayer's rent can always be reclaimed.
 pub const CLOSE_GRACE_SECS: i64 = 7 * 24 * 60 * 60;
+/// schema_version values. 1 = top-N leaderboard, no enforced anti-snipe companion (auctions created
+/// before §7). 2 = top-N + MANDATORY AuctionExt companion: every bid MUST supply it (audit N-2), so a
+/// bidder can no longer omit the optional `auction_ext` (the program-id `None` sentinel) to silently
+/// disable the end_time extension and snipe the final slot. Money gates (claim/withdraw) accept both;
+/// only the bid paths enforce the companion for v2. Bump this (never reuse) for future schema changes.
+pub const SCHEMA_VERSION_ANTISNIPE: u8 = 2;
 
 // bidon parimutuel auctions on ZK Compression. Hybrid model:
 //  - Config / Auction / Vault: regular accounts (the hot global leader + the USDC pool).
@@ -152,7 +158,9 @@ pub mod bidon_zk {
         auction.winner_count = winner_count;
         auction.winners = [WinnerSlot::default(); MAX_WINNERS];
         auction.winners_filled = 0;
-        auction.schema_version = 1;
+        // schema_version = 2: this auction is created WITH an AuctionExt companion (below), so every
+        // subsequent bid is required to supply it (audit N-2). See SCHEMA_VERSION_ANTISNIPE.
+        auction.schema_version = SCHEMA_VERSION_ANTISNIPE;
         let end_time = auction.end_time; // последнее использование auction перед ext (NLL освобождает borrow)
 
         // Компаньон антиснайпа: потолок = конец при создании + заданное создателем макс. продление.
@@ -275,7 +283,12 @@ pub mod bidon_zk {
         // антиснайп (§7): смена набора победителей у нового аука (есть компаньон) в финальном окне
         // продлевает end_time. cap = None (старый аук без компаньона) → продления нет.
         let set_changed = auction.update_top(proposal_id, amount);
-        let cap = ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time);
+        // audit N-2: для v2-аукционов auction_ext ОБЯЗАТЕЛЕН — иначе снайпер пропускает опциональный
+        // аккаунт (сентинел None) и продление молча отключается.
+        let cap = antisnipe_cap(
+            auction.schema_version,
+            ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time),
+        )?;
         extend_if_sniped(&mut auction.end_time, cap, set_changed)?;
         auction.proposal_count = auction
             .proposal_count
@@ -390,7 +403,10 @@ pub mod bidon_zk {
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
         let set_changed = auction.update_top(proposal_id, new_total);
-        let cap = ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time);
+        let cap = antisnipe_cap(
+            auction.schema_version,
+            ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time),
+        )?; // audit N-2
         extend_if_sniped(&mut auction.end_time, cap, set_changed)?; // антиснайп §7
 
         Ok(())
@@ -501,7 +517,10 @@ pub mod bidon_zk {
             .checked_add(amount)
             .ok_or(BidonError::MathOverflow)?;
         let set_changed = auction.update_top(proposal_id, new_total);
-        let cap = ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time);
+        let cap = antisnipe_cap(
+            auction.schema_version,
+            ctx.accounts.auction_ext.as_ref().map(|e| e.max_end_time),
+        )?; // audit N-2
         extend_if_sniped(&mut auction.end_time, cap, set_changed)?; // антиснайп §7
 
         Ok(())
@@ -517,9 +536,10 @@ pub mod bidon_zk {
             BidonError::AuctionNotEnded
         );
         require!(!ctx.accounts.auction.creator_paid, BidonError::AlreadyClaimed);
-        // Defence-in-depth: a non-migrated legacy account is fail-closed here.
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept both the top-N
+        // schema (1) and the anti-snipe schema (2, audit N-2) — a v0 legacy account (0) is rejected.
         require!(
-            ctx.accounts.auction.schema_version == 1,
+            matches!(ctx.accounts.auction.schema_version, 1 | 2),
             BidonError::NotMigrated
         );
 
@@ -603,9 +623,10 @@ pub mod bidon_zk {
             now >= ctx.accounts.auction.end_time,
             BidonError::AuctionNotEnded
         );
-        // Defence-in-depth: a non-migrated legacy account is fail-closed here.
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept both the top-N
+        // schema (1) and the anti-snipe schema (2, audit N-2) — a v0 legacy account (0) is rejected.
         require!(
-            ctx.accounts.auction.schema_version == 1,
+            matches!(ctx.accounts.auction.schema_version, 1 | 2),
             BidonError::NotMigrated
         );
         // Exact mirror of claim: refunds are forbidden to exactly the pids in winners[0..filled].
@@ -881,6 +902,8 @@ pub enum BidonError {
     InvariantViolation,
     #[msg("proposal_id does not match the compressed proposal account")]
     ProposalIdMismatch,
+    #[msg("anti-snipe auction requires its AuctionExt companion account")]
+    AntisnipeExtRequired,
 }
 
 #[derive(Accounts)]
@@ -1282,6 +1305,23 @@ pub struct AuctionExt {
     /// НИКОГДА не двигает end_time дальше этого значения.
     pub max_end_time: i64,
     pub bump: u8,
+}
+
+/// Resolve the anti-snipe extension cap for a bid, ENFORCING companion presence (audit N-2).
+/// `ext_max_end_time` is `Some(cap)` when the caller supplied the AuctionExt companion, else `None`.
+/// For a v2 auction (created WITH a companion) it is mandatory: a missing companion (the bidder passed
+/// the program-id `None` sentinel) fails closed with `AntisnipeExtRequired` instead of silently
+/// skipping the extension — otherwise the whole §7 anti-snipe control is bypassable by simply not
+/// supplying the optional account. Legacy auctions (schema 1, pre-§7) never had a companion, so it
+/// stays optional there and no extension applies (backward compatible).
+fn antisnipe_cap(schema_version: u8, ext_max_end_time: Option<i64>) -> Result<Option<i64>> {
+    if schema_version == SCHEMA_VERSION_ANTISNIPE {
+        Ok(Some(
+            ext_max_end_time.ok_or(BidonError::AntisnipeExtRequired)?,
+        ))
+    } else {
+        Ok(ext_max_end_time)
+    }
 }
 
 /// Антиснайп (§7): если ставка сменила НАБОР победителей (`set_changed`) и до конца осталось меньше

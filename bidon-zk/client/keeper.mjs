@@ -7,7 +7,7 @@
 //   Секреты: KORA_PRIVATE_KEY (base58 релейер), STORE_URL, HELIUS_RPC (для withdraw-proof).
 import './load-env.mjs';
 import { Keypair, PublicKey } from '@solana/web3.js';
-import { getOrCreateAssociatedTokenAccount } from '@solana/spl-token';
+import { getOrCreateAssociatedTokenAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { createPrivateKey, sign as edSign } from 'crypto';
 import {
@@ -135,7 +135,12 @@ async function resolveAuction(cfg, a) {
     attempted++;
     try {
       const bidderPk = new PublicKey(bidder);
-      const bidderToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, bidderPk)).address;
+      // АУДИТ N-1: НЕ создаём ATA лузеру здесь. Прежний getOrCreateAssociatedTokenAccount платил ренту
+      // с релеера за КАЖДЫЙ адрес из НЕаутентифицированной ленты стора — атакующий инъектил фейковых
+      // «лузеров» со своими pubkey (POST /bid без подписи) и сливал SOL релеера (возвращая ренту себе
+      // закрытием ATA). Теперь только ВЫЧИСЛЯЕМ адрес: у легит-лузера ATA есть с момента ставки → возврат
+      // проходит; для фейка buildWithdraw упадёт на отсутствующем Bid (ATA не создаётся, tx не шлётся).
+      const bidderToken = getAssociatedTokenAddressSync(cfg.usdcMint, bidderPk);
       const wd = await buildWithdraw(lrpc, ctx, bidderPk, bidderToken, pid);
       await sendIx(conn, [cuLimit(400_000), wd.ix], relayer, [], `withdraw`);
       console.log(`[#${id}] ✓ возврат pid${pid} ${bidder.slice(0, 8)}…`);
@@ -191,7 +196,7 @@ async function tick() {
       if (!info) { markDone(id); continue; } // закрыт/не существует → done
       const a = decodeAuction(info.data);
       if (Number(a.endTime) > now) { active++; continue; } // ещё идёт — перепроверим в след. тик
-      if (a.schemaVersion !== 1) { markDone(id); continue; } // legacy (заморожен) → done
+      if (a.schemaVersion !== 1 && a.schemaVersion !== 2) { markDone(id); continue; } // legacy (заморожен) → done; 2 = антиснайп-схема (N-2)
       const { done } = await resolveAuction(cfg, a);
       processed++;
       if (done) markDone(id);

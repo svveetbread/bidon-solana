@@ -31,6 +31,12 @@ pub struct Ctx {
     pub config_pda: Pubkey,
     pub auction_pda: Pubkey,
     pub vault_pda: Pubkey,
+    pub auction_ext_pda: Pubkey, // §7 антиснайп-компаньон (обязателен на бид-путях, audit N-2)
+}
+
+/// Derive the AuctionExt companion PDA (§7): seeds = ["auction_ext", id LE].
+pub fn auction_ext_pda(id: u64) -> Pubkey {
+    Pubkey::find_program_address(&[b"auction_ext", &id.to_le_bytes()], &bidon_zk::ID).0
 }
 
 pub async fn new_rpc() -> LightProgramTest {
@@ -75,6 +81,7 @@ pub async fn setup_n(rpc: &mut LightProgramTest, min_bid: u64, winner_count: u8)
         config_pda,
         auction_pda,
         vault_pda,
+        auction_ext_pda: auction_ext_pda(id),
     }
 }
 
@@ -280,11 +287,24 @@ pub async fn do_top_up_bid(
     send_bid_ix(rpc, ctx, bidder, bidder_token, rem, data).await;
 }
 
-/// Named accounts for place_bid / raise_bid / top_up_bid (identical layouts).
+/// Named accounts for place_bid / raise_bid / top_up_bid (identical layouts). Supplies the §7
+/// AuctionExt companion (mandatory for v2 auctions, audit N-2).
 fn bid_accounts(
     ctx: &Ctx,
     bidder: Pubkey,
     bidder_token: Pubkey,
+) -> Vec<solana_sdk::instruction::AccountMeta> {
+    bid_accounts_ext(ctx, bidder, bidder_token, Some(ctx.auction_ext_pda))
+}
+
+/// Like `bid_accounts` but lets a test choose whether to supply the optional `auction_ext`. Passing
+/// `None` reproduces the audit N-2 attack: omit the companion (program-id sentinel) to try to skip the
+/// anti-snipe extension — a v2 auction must reject this with `AntisnipeExtRequired`.
+fn bid_accounts_ext(
+    ctx: &Ctx,
+    bidder: Pubkey,
+    bidder_token: Pubkey,
+    auction_ext: Option<Pubkey>,
 ) -> Vec<solana_sdk::instruction::AccountMeta> {
     bidon_zk::accounts::RaiseBid {
         config: ctx.config_pda,
@@ -295,6 +315,7 @@ fn bid_accounts(
         bidder,
         payer: ctx.payer.pubkey(),
         token_program: spl_token::ID,
+        auction_ext,
     }
     .to_account_metas(None)
 }
@@ -442,6 +463,7 @@ pub fn create_auction_ix(
             auction: auction_pda,
             usdc_mint: mint,
             vault: vault_pda,
+            auction_ext: auction_ext_pda(id), // §7 антиснайп-компаньон (init)
             creator: creator.pubkey(),
             payer: payer.pubkey(),
             token_program: spl_token::ID,
@@ -453,6 +475,7 @@ pub fn create_auction_ix(
             min_bid,
             duration_secs: 3600,
             winner_count,
+            max_extension_secs: 600, // потолок продления в тестах (в границах 60..3600)
         }
         .data(),
     }
@@ -668,11 +691,12 @@ pub async fn create_extra_auction(
         config_pda: base.config_pda,
         auction_pda,
         vault_pda,
+        auction_ext_pda: auction_ext_pda(id),
     }
 }
 
 /// Like do_place_bid but returns Ok/Err instead of unwrapping (for rejection assertions, e.g.
-/// the zero-amount guard H-1).
+/// the zero-amount guard H-1). Supplies the §7 AuctionExt companion.
 pub async fn try_place_bid(
     rpc: &mut LightProgramTest,
     ctx: &Ctx,
@@ -681,6 +705,35 @@ pub async fn try_place_bid(
     pid: u64,
     content_hash: [u8; 32],
     amount: u64,
+) -> std::result::Result<(), ()> {
+    try_place_bid_ext(rpc, ctx, bidder, bidder_token, pid, content_hash, amount, true).await
+}
+
+/// place_bid attempt that OMITS the AuctionExt companion (passes the program-id `None` sentinel).
+/// Reproduces the audit N-2 attack: a v2 auction must reject it with `AntisnipeExtRequired`.
+pub async fn try_place_bid_without_ext(
+    rpc: &mut LightProgramTest,
+    ctx: &Ctx,
+    bidder: &Keypair,
+    bidder_token: Pubkey,
+    pid: u64,
+    content_hash: [u8; 32],
+    amount: u64,
+) -> std::result::Result<(), ()> {
+    try_place_bid_ext(rpc, ctx, bidder, bidder_token, pid, content_hash, amount, false).await
+}
+
+/// Shared place_bid builder; `with_ext` chooses whether to supply the §7 companion (audit N-2).
+#[allow(clippy::too_many_arguments)]
+async fn try_place_bid_ext(
+    rpc: &mut LightProgramTest,
+    ctx: &Ctx,
+    bidder: &Keypair,
+    bidder_token: Pubkey,
+    pid: u64,
+    content_hash: [u8; 32],
+    amount: u64,
+    with_ext: bool,
 ) -> std::result::Result<(), ()> {
     let address_tree = rpc.get_address_tree_v2().tree;
     let p_addr = proposal_address(rpc, ctx.auction_pda, pid);
@@ -718,7 +771,8 @@ pub async fn try_place_bid(
         amount,
     }
     .data();
-    let mut accounts = bid_accounts(ctx, bidder.pubkey(), bidder_token);
+    let ext = if with_ext { Some(ctx.auction_ext_pda) } else { None };
+    let mut accounts = bid_accounts_ext(ctx, bidder.pubkey(), bidder_token, ext);
     let (rem, _, _) = remaining.to_account_metas();
     accounts.extend(rem);
     let cu = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
