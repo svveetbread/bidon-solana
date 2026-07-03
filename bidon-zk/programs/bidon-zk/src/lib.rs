@@ -67,6 +67,18 @@ pub const CLOSE_GRACE_SECS: i64 = 7 * 24 * 60 * 60;
 /// disable the end_time extension and snipe the final slot. Money gates (claim/withdraw) accept both;
 /// only the bid paths enforce the companion for v2. Bump this (never reuse) for future schema changes.
 pub const SCHEMA_VERSION_ANTISNIPE: u8 = 2;
+/// schema_version 3 = top-N + MANDATORY anti-snipe companion + refundable creator deposit. Auctions
+/// created on v3 pull CREATOR_DEPOSIT at create and refund it at claim (to the creator) or at cancel
+/// (empty auction → whole vault, i.e. the deposit + any dust). A v3 auction is identified purely by
+/// schema_version == 3 (no new Auction field), so old v1/v2 accounts still deserialize.
+pub const SCHEMA_VERSION_DEPOSIT: u8 = 3;
+/// Refundable anti-spam deposit (approach "B"): creating an auction locks 0.5 USDC of the creator's
+/// capital, refunded in full to an honest creator at claim/cancel. NOT a fee — mass auction spam
+/// therefore locks the spammer's capital.
+/// NEVER change this value while schema-3 auctions are live — the deposit pulled at create must equal
+/// the deposit refunded at claim/cancel for the SAME auction; to change the amount, bump to a new
+/// schema_version and branch the refund on it.
+pub const CREATOR_DEPOSIT: u64 = 500_000; // 0.5 USDC (6 decimals)
 
 // bidon parimutuel auctions on ZK Compression. Hybrid model:
 //  - Config / Auction / Vault: regular accounts (the hot global leader + the USDC pool).
@@ -158,9 +170,9 @@ pub mod bidon_zk {
         auction.winner_count = winner_count;
         auction.winners = [WinnerSlot::default(); MAX_WINNERS];
         auction.winners_filled = 0;
-        // schema_version = 2: this auction is created WITH an AuctionExt companion (below), so every
-        // subsequent bid is required to supply it (audit N-2). See SCHEMA_VERSION_ANTISNIPE.
-        auction.schema_version = SCHEMA_VERSION_ANTISNIPE;
+        // schema_version = 3: created WITH an AuctionExt companion (mandatory on every bid, audit N-2)
+        // AND with a refundable creator deposit pulled below. See SCHEMA_VERSION_DEPOSIT.
+        auction.schema_version = SCHEMA_VERSION_DEPOSIT;
         let end_time = auction.end_time; // последнее использование auction перед ext (NLL освобождает borrow)
 
         // Компаньон антиснайпа: потолок = конец при создании + заданное создателем макс. продление.
@@ -177,6 +189,18 @@ pub mod bidon_zk {
             .auction_count
             .checked_add(1)
             .ok_or(BidonError::MathOverflow)?;
+
+        // Refundable anti-spam deposit (schema 3): pull CREATOR_DEPOSIT from the creator into the vault.
+        // The vault was just `init`ed by Anchor (account resolution), so it exists and this transfer is
+        // valid. Refunded to the creator at claim (§claim_winnings) or at cancel (§cancel_auction).
+        transfer_to_vault(
+            &ctx.accounts.token_program,
+            &ctx.accounts.creator_token,
+            &ctx.accounts.usdc_mint,
+            &ctx.accounts.vault,
+            &ctx.accounts.creator,
+            CREATOR_DEPOSIT,
+        )?;
         Ok(())
     }
 
@@ -536,10 +560,10 @@ pub mod bidon_zk {
             BidonError::AuctionNotEnded
         );
         require!(!ctx.accounts.auction.creator_paid, BidonError::AlreadyClaimed);
-        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept both the top-N
-        // schema (1) and the anti-snipe schema (2, audit N-2) — a v0 legacy account (0) is rejected.
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept the top-N schema
+        // (1), the anti-snipe schema (2, audit N-2) and the deposit schema (3) — v0 legacy (0) rejected.
         require!(
-            matches!(ctx.accounts.auction.schema_version, 1 | 2),
+            matches!(ctx.accounts.auction.schema_version, 1 | 2 | 3),
             BidonError::NotMigrated
         );
 
@@ -601,6 +625,26 @@ pub mod bidon_zk {
             )?;
         }
 
+        // Refund the schema-3 anti-spam deposit to the creator. INVARIANT (fund conservation): before
+        // claim, vault.amount == total_staked + CREATOR_DEPOSIT − (losers already withdrawn). We just
+        // paid out payout+fee == winners_pot from the vault, and the `winners_pot <= vault.amount` gate
+        // above holds (the vault is exactly CREATOR_DEPOSIT larger than the staked pool). So the vault
+        // remaining == (total_staked − winners_pot − withdrawn) + CREATOR_DEPOSIT ≥ CREATOR_DEPOSIT,
+        // hence this transfer always has funds. The deposit never touches the fee/payout math on
+        // winners_pot; it is a separate, exact CREATOR_DEPOSIT that only ever returns to the creator.
+        if ctx.accounts.auction.schema_version == SCHEMA_VERSION_DEPOSIT {
+            vault_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.creator_token,
+                &ctx.accounts.auction,
+                signer_seeds,
+                CREATOR_DEPOSIT,
+                decimals,
+            )?;
+        }
+
         ctx.accounts.auction.creator_paid = true;
         Ok(())
     }
@@ -623,10 +667,10 @@ pub mod bidon_zk {
             now >= ctx.accounts.auction.end_time,
             BidonError::AuctionNotEnded
         );
-        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept both the top-N
-        // schema (1) and the anti-snipe schema (2, audit N-2) — a v0 legacy account (0) is rejected.
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept the top-N schema
+        // (1), the anti-snipe schema (2, audit N-2) and the deposit schema (3) — v0 legacy (0) rejected.
         require!(
-            matches!(ctx.accounts.auction.schema_version, 1 | 2),
+            matches!(ctx.accounts.auction.schema_version, 1 | 2 | 3),
             BidonError::NotMigrated
         );
         // Exact mirror of claim: refunds are forbidden to exactly the pids in winners[0..filled].
@@ -749,6 +793,27 @@ pub mod bidon_zk {
         let id_bytes = ctx.accounts.auction.id.to_le_bytes();
         let bump = ctx.accounts.auction.bump;
         let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
+
+        // Empty auction (proposal_count == 0) → the vault holds ONLY the schema-3 creator deposit (+ any
+        // stray dust donated straight into the SPL account), NEVER staked bids. Refund the ENTIRE
+        // vault.amount (not the constant) to the creator so any dust clears too and close_account never
+        // fails on a non-zero balance — this also fixes the pre-existing "dust blocks cancel" for old
+        // (deposit-less) auctions, where the amount is simply 0 and this is a no-op.
+        let decimals = ctx.accounts.usdc_mint.decimals;
+        let amt = ctx.accounts.vault.amount;
+        if amt > 0 {
+            vault_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.creator_token,
+                &ctx.accounts.auction,
+                signer_seeds,
+                amt,
+                decimals,
+            )?;
+        }
+
         close_account(CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             CloseAccount {
@@ -971,6 +1036,9 @@ pub struct CreateAuction<'info> {
     pub auction_ext: Account<'info, AuctionExt>,
     /// Auction creator — authority (signs), pays NO rent.
     pub creator: Signer<'info>,
+    /// Creator's USDC token account — source of the refundable anti-spam deposit.
+    #[account(mut, token::mint = usdc_mint, token::authority = creator)]
+    pub creator_token: Account<'info, TokenAccount>,
     /// Rent + tx-fee payer (relayer/gasless). Rent refunded to it on close.
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -1153,6 +1221,16 @@ pub struct CancelAuction<'info> {
         token::authority = auction,
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
+    /// USDC mint — needed for transfer_checked decimals when refunding the deposit before close.
+    pub usdc_mint: Box<Account<'info, Mint>>,
+    /// Creator's USDC token account — receives the refunded deposit (+ any dust) before the vault
+    /// closes. Bound to the auction's creator and the USDC mint so funds can only return to the creator.
+    #[account(
+        mut,
+        constraint = creator_token.owner == auction.creator @ BidonError::Unauthorized,
+        constraint = creator_token.mint == usdc_mint.key() @ BidonError::InvalidMint,
+    )]
+    pub creator_token: Box<Account<'info, TokenAccount>>,
     /// Auction creator — authority (signs), pays NO rent (0 SOL ok; relayer is the fee-payer).
     pub creator: Signer<'info>,
     /// CHECK: address checked (== auction.rent_payer); receives the vault + Auction rent.
@@ -1315,7 +1393,9 @@ pub struct AuctionExt {
 /// supplying the optional account. Legacy auctions (schema 1, pre-§7) never had a companion, so it
 /// stays optional there and no extension applies (backward compatible).
 fn antisnipe_cap(schema_version: u8, ext_max_end_time: Option<i64>) -> Result<Option<i64>> {
-    if schema_version == SCHEMA_VERSION_ANTISNIPE {
+    // Both the anti-snipe schema (2) and every later schema that keeps the mandatory companion (3+)
+    // enforce companion presence — a missing companion fails closed with AntisnipeExtRequired.
+    if schema_version >= SCHEMA_VERSION_ANTISNIPE {
         Ok(Some(
             ext_max_end_time.ok_or(BidonError::AntisnipeExtRequired)?,
         ))

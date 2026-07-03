@@ -29,8 +29,11 @@ async fn test_place_bid() {
     assert_eq!(bid.proposal, pid);
     assert_eq!(bid.bidder, bidder.pubkey());
 
-    // USDC moved into the vault; bidder debited.
-    assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, amount);
+    // USDC moved into the vault (on top of the creator's deposit); bidder debited.
+    assert_eq!(
+        token_amount(&mut rpc, ctx.vault_pda).await,
+        amount + bidon_zk::CREATOR_DEPOSIT
+    );
     assert_eq!(token_amount(&mut rpc, bidder_token).await, 1_000_000 - amount);
 
     // Auction leader + counters.

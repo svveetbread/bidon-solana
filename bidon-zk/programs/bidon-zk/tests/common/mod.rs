@@ -32,6 +32,7 @@ pub struct Ctx {
     pub auction_pda: Pubkey,
     pub vault_pda: Pubkey,
     pub auction_ext_pda: Pubkey, // §7 антиснайп-компаньон (обязателен на бид-путях, audit N-2)
+    pub creator_token: Pubkey,   // creator's USDC ATA (source of the refundable deposit)
 }
 
 /// Derive the AuctionExt companion PDA (§7): seeds = ["auction_ext", id LE].
@@ -67,9 +68,12 @@ pub async fn setup_n(rpc: &mut LightProgramTest, min_bid: u64, winner_count: u8)
         Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
     let (vault_pda, _) =
         Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
+    // Fund the creator's USDC ATA so create_auction can pull the refundable deposit (schema 3).
+    let creator_token =
+        funded_token_account(rpc, &payer, mint, &creator.pubkey(), 10_000_000).await;
     create_auction(
-        rpc, &payer, &creator, config_pda, auction_pda, vault_pda, mint, id, min_bid,
-        winner_count,
+        rpc, &payer, &creator, config_pda, auction_pda, vault_pda, mint, creator_token, id,
+        min_bid, winner_count,
     )
     .await;
 
@@ -82,6 +86,7 @@ pub async fn setup_n(rpc: &mut LightProgramTest, min_bid: u64, winner_count: u8)
         auction_pda,
         vault_pda,
         auction_ext_pda: auction_ext_pda(id),
+        creator_token,
     }
 }
 
@@ -428,13 +433,15 @@ pub async fn create_auction(
     auction_pda: Pubkey,
     vault_pda: Pubkey,
     mint: Pubkey,
+    creator_token: Pubkey,
     id: u64,
     min_bid: u64,
     winner_count: u8,
 ) {
     rpc.create_and_send_transaction(
         &[create_auction_ix(
-            payer, creator, config_pda, auction_pda, vault_pda, mint, id, min_bid, winner_count,
+            payer, creator, config_pda, auction_pda, vault_pda, mint, creator_token, id, min_bid,
+            winner_count,
         )],
         &payer.pubkey(),
         &[payer, creator],
@@ -452,6 +459,7 @@ pub fn create_auction_ix(
     auction_pda: Pubkey,
     vault_pda: Pubkey,
     mint: Pubkey,
+    creator_token: Pubkey,
     id: u64,
     min_bid: u64,
     winner_count: u8,
@@ -465,6 +473,7 @@ pub fn create_auction_ix(
             vault: vault_pda,
             auction_ext: auction_ext_pda(id), // §7 антиснайп-компаньон (init)
             creator: creator.pubkey(),
+            creator_token, // источник возвратного депозита (схема 3)
             payer: payer.pubkey(),
             token_program: spl_token::ID,
             system_program: system_program::ID,
@@ -678,9 +687,11 @@ pub async fn create_extra_auction(
         Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
     let (vault_pda, _) =
         Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
+    let creator_token =
+        funded_token_account(rpc, &base.payer, base.mint, &creator.pubkey(), 10_000_000).await;
     create_auction(
-        rpc, &base.payer, &creator, base.config_pda, auction_pda, vault_pda, base.mint, id,
-        min_bid, winner_count,
+        rpc, &base.payer, &creator, base.config_pda, auction_pda, vault_pda, base.mint,
+        creator_token, id, min_bid, winner_count,
     )
     .await;
     Ctx {
@@ -692,6 +703,7 @@ pub async fn create_extra_auction(
         auction_pda,
         vault_pda,
         auction_ext_pda: auction_ext_pda(id),
+        creator_token,
     }
 }
 

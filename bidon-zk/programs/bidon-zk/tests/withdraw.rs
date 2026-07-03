@@ -33,6 +33,9 @@ async fn test_withdraw_loser() {
     let acc = compressed(&mut rpc, a_bid).await;
     assert_eq!(acc.data, Some(Default::default()));
 
-    // Vault still holds B's winning 0.8.
-    assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 800_000);
+    // Vault still holds B's winning 0.8 plus the creator's unclaimed 0.5 deposit (claim not run).
+    assert_eq!(
+        token_amount(&mut rpc, ctx.vault_pda).await,
+        800_000 + bidon_zk::CREATOR_DEPOSIT
+    );
 }
