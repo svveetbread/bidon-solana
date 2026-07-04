@@ -196,7 +196,7 @@ async function tick() {
       if (!info) { markDone(id); continue; } // закрыт/не существует → done
       const a = decodeAuction(info.data);
       if (Number(a.endTime) > now) { active++; continue; } // ещё идёт — перепроверим в след. тик
-      if (a.schemaVersion !== 1 && a.schemaVersion !== 2) { markDone(id); continue; } // legacy (заморожен) → done; 2 = антиснайп-схема (N-2)
+      if (a.schemaVersion < 1 || a.schemaVersion > 3) { markDone(id); continue; } // legacy v0 (заморожен) → done; 1=топ-N, 2=антиснайп (N-2), 3=депозит
       const { done } = await resolveAuction(cfg, a);
       processed++;
       if (done) markDone(id);

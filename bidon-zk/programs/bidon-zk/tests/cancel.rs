@@ -20,13 +20,19 @@ fn anchor_code(e: BidonError) -> u32 {
     6000 + e as u32
 }
 
-/// Build a cancel_auction instruction (creator-only). fee-payer/relayer signs at send time.
+/// Build a cancel_auction instruction (creator-only). fee-payer/relayer signs at send time. Supplies the
+/// schema-3 deposit-refund accounts (config, deposit_vault, usdc_mint, creator_token). `creator_token`
+/// is the real creator's USDC account (the on-chain constraint pins it to auction.creator).
 fn cancel_ix(ctx: &Ctx, creator: Pubkey, rent_recipient: Pubkey) -> Instruction {
     Instruction {
         program_id: bidon_zk::ID,
         accounts: bidon_zk::accounts::CancelAuction {
+            config: ctx.config_pda,
             auction: ctx.auction_pda,
             vault: ctx.vault_pda,
+            deposit_vault: ctx.deposit_vault_pda,
+            usdc_mint: ctx.mint,
+            creator_token: ctx.creator_token,
             creator,
             rent_recipient,
             token_program: spl_token::ID,

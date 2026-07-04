@@ -23,13 +23,21 @@ async fn test_claim_winnings() {
     let fee_receiver_token =
         token_account(&mut rpc, &ctx.payer, ctx.mint, &ctx.owner.pubkey()).await;
 
+    // Schema-3: the deposit vault holds CREATOR_DEPOSIT BEFORE claim (pulled at create).
+    assert_eq!(token_amount(&mut rpc, ctx.deposit_vault_pda).await, bidon_zk::CREATOR_DEPOSIT);
+
     warp_past(&mut rpc, 3601);
     do_claim(&mut rpc, &ctx, creator_token, fee_receiver_token).await;
 
-    // fee = 1.0 * 370 / 10000 = 0.037; payout = 0.963.
+    // fee = 1.0 * 370 / 10000 = 0.037; payout = 0.963. Creator also gets CREATOR_DEPOSIT refunded.
     let fee = amount * 370 / 10_000;
-    assert_eq!(token_amount(&mut rpc, creator_token).await, amount - fee);
+    assert_eq!(
+        token_amount(&mut rpc, creator_token).await,
+        amount - fee + bidon_zk::CREATOR_DEPOSIT
+    );
     assert_eq!(token_amount(&mut rpc, fee_receiver_token).await, fee);
     assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 0);
+    // The global deposit vault was drained by exactly one CREATOR_DEPOSIT.
+    assert_eq!(token_amount(&mut rpc, ctx.deposit_vault_pda).await, 0);
     assert!(get_auction(&mut rpc, ctx.auction_pda).await.creator_paid);
 }

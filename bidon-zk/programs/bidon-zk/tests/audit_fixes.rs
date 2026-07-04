@@ -80,10 +80,10 @@ async fn test_reject_zero_amount_bid() {
 #[tokio::test]
 async fn test_bid_without_antisnipe_ext_rejected() {
     let mut rpc = new_rpc().await;
-    let ctx = setup(&mut rpc, MIN_BID).await; // fresh auction → anti-snipe schema (v2)
+    let ctx = setup(&mut rpc, MIN_BID).await; // fresh auction → deposit schema (v3, still enforces companion)
 
-    // Sanity: new auctions are created on the anti-snipe schema (2).
-    assert_eq!(get_auction(&mut rpc, ctx.auction_pda).await.schema_version, 2);
+    // Sanity: new auctions are created on the deposit schema (3); schema >= 2 enforces the companion.
+    assert_eq!(get_auction(&mut rpc, ctx.auction_pda).await.schema_version, 3);
 
     let (bidder, token) = funded_bidder(&mut rpc, &ctx, 1_000_000).await;
 

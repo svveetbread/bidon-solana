@@ -99,8 +99,41 @@ async fn test_foundation() {
         .unwrap();
     assert_eq!(get_config(&mut rpc, config_pda).await.fee_bps, 500);
 
-    // 3. create_auction — gasless: creator has 0 SOL, relayer (payer) fronts rent.
+    // 3a. init_deposit_vault (schema 3): create the GLOBAL creator-deposit vault (relayer fronts its rent).
+    let (deposit_vault_pda, _) =
+        Pubkey::find_program_address(&[b"deposit_vault"], &bidon_zk::ID);
+    let ix = Instruction {
+        program_id: bidon_zk::ID,
+        accounts: bidon_zk::accounts::InitDepositVault {
+            config: config_pda,
+            usdc_mint: mint.pubkey(),
+            deposit_vault: deposit_vault_pda,
+            payer: payer.pubkey(),
+            token_program: spl_token::ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: bidon_zk::instruction::InitDepositVault {}.data(),
+    };
+    rpc.create_and_send_transaction(&[ix], &payer.pubkey(), &[&payer])
+        .await
+        .unwrap();
+    assert_eq!(token_amount(&mut rpc, deposit_vault_pda).await, 0);
+
+    // 3b. Fund the creator's USDC account (source of the schema-3 deposit). Creator still holds 0 SOL.
     let creator = Keypair::new();
+    let creator_funding = 10_000_000u64; // 10 USDC
+    let creator_token = new_token_account(
+        &mut rpc,
+        &payer,
+        mint.pubkey(),
+        &creator.pubkey(),
+        creator_funding,
+    )
+    .await;
+
+    // 3c. create_auction — gasless: creator has 0 SOL, relayer (payer) fronts rent. Pulls CREATOR_DEPOSIT
+    // from the creator into the GLOBAL deposit vault (NOT the per-auction vault, which stays empty).
     let id = 0u64;
     let (auction_pda, _) =
         Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
@@ -115,8 +148,10 @@ async fn test_foundation() {
             auction: auction_pda,
             usdc_mint: mint.pubkey(),
             vault: vault_pda,
+            deposit_vault: deposit_vault_pda,
             auction_ext: auction_ext_pda,
             creator: creator.pubkey(),
+            creator_token,
             payer: payer.pubkey(),
             token_program: spl_token::ID,
             system_program: system_program::ID,
@@ -143,6 +178,19 @@ async fn test_foundation() {
     assert_eq!(auction.winner_amount, 0);
     assert_eq!(auction.rent_payer, payer.pubkey()); // relayer gets rent back on close
     assert!(!auction.creator_paid);
+    assert_eq!(auction.schema_version, 3); // global-vault deposit schema
+
+    // Schema-3 deposit conservation: the GLOBAL deposit vault holds exactly CREATOR_DEPOSIT; the creator
+    // was debited by CREATOR_DEPOSIT; the per-auction vault holds NOTHING (deposit is global, not per-auction).
+    assert_eq!(
+        token_amount(&mut rpc, deposit_vault_pda).await,
+        bidon_zk::CREATOR_DEPOSIT
+    );
+    assert_eq!(
+        token_amount(&mut rpc, creator_token).await,
+        creator_funding - bidon_zk::CREATOR_DEPOSIT
+    );
+    assert_eq!(token_amount(&mut rpc, vault_pda).await, 0);
 
     // creator stayed accountless = 0 SOL (gasless), relayer paid all rent.
     assert!(
@@ -152,6 +200,42 @@ async fn test_foundation() {
 
     // auction_count advanced.
     assert_eq!(get_config(&mut rpc, config_pda).await.auction_count, 1);
+}
+
+/// SPL token account amount is at offset 64 (mint 32 + owner 32).
+async fn token_amount(rpc: &mut LightProgramTest, pda: Pubkey) -> u64 {
+    let acc = rpc.get_account(pda).await.unwrap().unwrap();
+    u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
+}
+
+/// Create a USDC token account owned by `owner`, funded with `amount` (mint authority = payer).
+async fn new_token_account(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+    mint: Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+) -> Pubkey {
+    let acc = Keypair::new();
+    let rent = rpc.get_minimum_balance_for_rent_exemption(165).await.unwrap();
+    let create =
+        system_instruction::create_account(&payer.pubkey(), &acc.pubkey(), rent, 165, &spl_token::ID);
+    let init =
+        spl_token::instruction::initialize_account3(&spl_token::ID, &acc.pubkey(), &mint, owner)
+            .unwrap();
+    let mint_to = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        &mint,
+        &acc.pubkey(),
+        &payer.pubkey(),
+        &[],
+        amount,
+    )
+    .unwrap();
+    rpc.create_and_send_transaction(&[create, init, mint_to], &payer.pubkey(), &[payer, &acc])
+        .await
+        .unwrap();
+    acc.pubkey()
 }
 
 async fn get_config(rpc: &mut LightProgramTest, pda: Pubkey) -> Config {

@@ -7,7 +7,7 @@ import {
   Connection, Keypair, PublicKey, Transaction, TransactionInstruction,
   SystemProgram, sendAndConfirmTransaction, ComputeBudgetProgram,
 } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
 
 // ---- constants ----
 export const PROGRAM_ID = new PublicKey('4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz');
@@ -24,6 +24,12 @@ export const HELIUS_RPC = process.env.HELIUS_RPC ||
 const CONFIG_SEED = Buffer.from('config');
 const AUCTION_SEED = Buffer.from('auction');
 const VAULT_SEED = Buffer.from('vault');
+const AUCTION_EXT_SEED = Buffer.from('auction_ext'); // компаньон антиснайпа (§7)
+const DEPOSIT_VAULT_SEED = Buffer.from('deposit_vault'); // GLOBAL deposit vault (schema 3)
+
+// Возвратный анти-спам-депозит создателя (schema 3): 0.5 USDC (6 знаков). Тянется в GLOBAL deposit vault
+// при create_auction, возвращается ОДИН раз — на claim (расчёт) ИЛИ cancel (пустой аук), но не оба.
+export const CREATOR_DEPOSIT = 500_000n;
 
 // ---- anchor discriminator ----
 export function disc(name) {
@@ -48,8 +54,13 @@ export const bytes32 = (arr) => {
 export const configPda = () => PublicKey.findProgramAddressSync([CONFIG_SEED], PROGRAM_ID)[0];
 export const auctionPda = (id) =>
   PublicKey.findProgramAddressSync([AUCTION_SEED, u64(id)], PROGRAM_ID)[0];
+export const auctionExtPda = (id) =>
+  PublicKey.findProgramAddressSync([AUCTION_EXT_SEED, u64(id)], PROGRAM_ID)[0];
 export const vaultPda = (auction) =>
   PublicKey.findProgramAddressSync([VAULT_SEED, auction.toBuffer()], PROGRAM_ID)[0];
+// GLOBAL deposit vault: singleton PDA (seed = "deposit_vault", без id), authority = Config PDA.
+export const depositVaultPda = () =>
+  PublicKey.findProgramAddressSync([DEPOSIT_VAULT_SEED], PROGRAM_ID)[0];
 
 // ---- account meta helper ----
 const m = (pubkey, isSigner, isWritable) => ({ pubkey, isSigner, isWritable });
@@ -78,12 +89,47 @@ export function ixSetConfig({ owner, feeBps, feeReceiver }) {
   });
 }
 
-// create_auction(id: u64, min_bid: u64, duration_secs: i64)
-export function ixCreateAuction({ id, minBid, durationSecs, creator, payer, usdcMint }) {
+// init_deposit_vault() — one-time setup of the GLOBAL deposit vault PDA token account (schema 3).
+// NO args. Accounts mirror InitDepositVault: config(ro) usdc_mint(ro) deposit_vault(w) payer(s,w)
+// token_program(ro) system_program(ro).
+export function ixInitDepositVault({ usdcMint, payer }) {
+  const config = configPda();
+  const depositVault = depositVaultPda();
+  return new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      m(config, false, false),
+      m(usdcMint, false, false),
+      m(depositVault, false, true),
+      m(payer, true, true),
+      m(TOKEN_PROGRAM_ID, false, false),
+      m(SystemProgram.programId, false, false),
+    ],
+    data: disc('init_deposit_vault'),
+  });
+}
+
+// create_auction(id: u64, min_bid: u64, duration_secs: i64, winner_count: u8, max_extension_secs: i64)
+// Accounts mirror CreateAuction: config(w) auction(w) usdc_mint(ro) vault(w) deposit_vault(w)
+// auction_ext(w) creator(s) creator_token(w) payer(s,w) token_program(ro) system_program(ro).
+export function ixCreateAuction({
+  id, minBid, durationSecs, winnerCount, maxExtensionSecs, creator, creatorToken, payer, usdcMint,
+}) {
   const config = configPda();
   const auction = auctionPda(id);
   const vault = vaultPda(auction);
-  const data = Buffer.concat([disc('create_auction'), u64(id), u64(minBid), i64(durationSecs)]);
+  const depositVault = depositVaultPda();
+  const auctionExt = auctionExtPda(id);
+  // ATA(creator) — источник анти-спам-депозита (schema 3), если явно не передан.
+  const creatorTok = creatorToken ?? getAssociatedTokenAddressSync(new PublicKey(usdcMint), creator);
+  const data = Buffer.concat([
+    disc('create_auction'),
+    u64(id),
+    u64(minBid),
+    i64(durationSecs),
+    u8(winnerCount),
+    i64(maxExtensionSecs),
+  ]);
   return new TransactionInstruction({
     programId: PROGRAM_ID,
     keys: [
@@ -91,7 +137,10 @@ export function ixCreateAuction({ id, minBid, durationSecs, creator, payer, usdc
       m(auction, false, true),
       m(usdcMint, false, false),
       m(vault, false, true),
+      m(depositVault, false, true), // GLOBAL deposit vault — после vault, до auction_ext
+      m(auctionExt, false, true), // компаньон антиснайпа (init)
       m(creator, true, false),
+      m(creatorTok, false, true), // ATA создателя — после creator, до payer
       m(payer, true, true),
       m(TOKEN_PROGRAM_ID, false, false),
       m(SystemProgram.programId, false, false),
@@ -104,6 +153,7 @@ export function ixCreateAuction({ id, minBid, durationSecs, creator, payer, usdc
 export function ixClaimWinnings({ id, vault, creatorToken, feeReceiverToken, usdcMint }) {
   const config = configPda();
   const auction = auctionPda(id);
+  const depositVault = depositVaultPda();
   const data = disc('claim_winnings');
   return new TransactionInstruction({
     programId: PROGRAM_ID,
@@ -111,6 +161,7 @@ export function ixClaimWinnings({ id, vault, creatorToken, feeReceiverToken, usd
       m(config, false, false),
       m(auction, false, true),
       m(vault, false, true),
+      m(depositVault, false, true), // GLOBAL deposit vault — после vault, до creator_token
       m(creatorToken, false, true),
       m(feeReceiverToken, false, true),
       m(usdcMint, false, false),
@@ -134,6 +185,33 @@ export function ixCloseAuction({ id, rentRecipient }) {
       m(TOKEN_PROGRAM_ID, false, false),
     ],
     data,
+  });
+}
+
+// cancel_auction() — creator-only, EMPTY auction. Accounts mirror CancelAuction: config(ro) auction(w)
+// vault(w) deposit_vault(w) usdc_mint(ro) creator_token(w) creator(s) rent_recipient(w) token_program(ro).
+// Schema-3: возвращает депозит создателю из GLOBAL deposit vault (если ещё не забран через claim).
+export function ixCancelAuction({ id, creator, creatorToken, rentRecipient, usdcMint }) {
+  const config = configPda();
+  const auction = auctionPda(id);
+  const vault = vaultPda(auction);
+  const depositVault = depositVaultPda();
+  // ATA(creator) — sink возврата депозита, если явно не передан.
+  const creatorTok = creatorToken ?? getAssociatedTokenAddressSync(new PublicKey(usdcMint), creator);
+  return new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      m(config, false, false), // config теперь ПЕРВЫЙ
+      m(auction, false, true),
+      m(vault, false, true),
+      m(depositVault, false, true), // GLOBAL deposit vault
+      m(usdcMint, false, false),
+      m(creatorTok, false, true), // ATA создателя — до creator
+      m(creator, true, false),
+      m(rentRecipient, false, true),
+      m(TOKEN_PROGRAM_ID, false, false),
+    ],
+    data: disc('cancel_auction'),
   });
 }
 

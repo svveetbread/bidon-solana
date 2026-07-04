@@ -66,7 +66,11 @@ async fn n1_eq_legacy() {
     do_claim(&mut rpc, &ctx, creator_t, fee_t).await;
 
     let fee = fee_of(800_000);
-    assert_eq!(token_amount(&mut rpc, creator_t).await, 800_000 - fee);
+    // Creator gets payout − fee PLUS the refunded schema-3 deposit.
+    assert_eq!(
+        token_amount(&mut rpc, creator_t).await,
+        800_000 - fee + bidon_zk::CREATOR_DEPOSIT
+    );
     assert_eq!(token_amount(&mut rpc, fee_t).await, fee);
 
     // The winner cannot withdraw; the two losers refund in full.
@@ -113,7 +117,11 @@ async fn top3_distinct() {
     let pot = 1_500_000u64; // 600k + 500k + 400k
     let fee = fee_of(pot);
     let payout = pot - fee;
-    assert_eq!(token_amount(&mut rpc, creator_t).await, payout);
+    // Creator gets payout PLUS the refunded schema-3 deposit.
+    assert_eq!(
+        token_amount(&mut rpc, creator_t).await,
+        payout + bidon_zk::CREATOR_DEPOSIT
+    );
     assert_eq!(token_amount(&mut rpc, fee_t).await, fee);
 
     // A winner cannot withdraw; losers refund.
@@ -245,7 +253,11 @@ async fn all_proposals_win() {
 
     let pot = 1_200_000u64;
     let fee = fee_of(pot);
-    assert_eq!(token_amount(&mut rpc, creator_t).await, pot - fee);
+    // Creator gets pot − fee PLUS the refunded schema-3 deposit.
+    assert_eq!(
+        token_amount(&mut rpc, creator_t).await,
+        pot - fee + bidon_zk::CREATOR_DEPOSIT
+    );
     assert_eq!(token_amount(&mut rpc, fee_t).await, fee);
     // Vault empty right after claim — there is nothing to withdraw.
     assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 0);
@@ -271,7 +283,11 @@ async fn winner_count_validation() {
     let mint = create_mint(&mut rpc, &payer).await;
     let (config_pda, _) = Pubkey::find_program_address(&[b"config"], &bidon_zk::ID);
     initialize_config(&mut rpc, &owner, config_pda, mint).await;
+    // schema-3: create the GLOBAL deposit vault and fund the creator so create_auction can pull its deposit.
+    init_deposit_vault(&mut rpc, &payer, config_pda, mint).await;
     let creator = Keypair::new();
+    let creator_token =
+        funded_token_account(&mut rpc, &payer, mint, &creator.pubkey(), 10_000_000).await;
 
     let pdas = |id: u64| {
         let (a, _) = Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
@@ -284,7 +300,7 @@ async fn winner_count_validation() {
     let r = rpc
         .create_and_send_transaction(
             &[create_auction_ix(
-                &payer, &creator, config_pda, a0, v0, mint, 0, MIN_BID, 0,
+                &payer, &creator, creator_token, config_pda, a0, v0, mint, 0, MIN_BID, 0,
             )],
             &payer.pubkey(),
             &[&payer, &creator],
@@ -296,7 +312,7 @@ async fn winner_count_validation() {
     let r = rpc
         .create_and_send_transaction(
             &[create_auction_ix(
-                &payer, &creator, config_pda, a0, v0, mint, 0, MIN_BID, 11,
+                &payer, &creator, creator_token, config_pda, a0, v0, mint, 0, MIN_BID, 11,
             )],
             &payer.pubkey(),
             &[&payer, &creator],
@@ -308,7 +324,7 @@ async fn winner_count_validation() {
     let r = rpc
         .create_and_send_transaction(
             &[create_auction_ix(
-                &payer, &creator, config_pda, a0, v0, mint, 0, MIN_BID, 1,
+                &payer, &creator, creator_token, config_pda, a0, v0, mint, 0, MIN_BID, 1,
             )],
             &payer.pubkey(),
             &[&payer, &creator],
@@ -321,7 +337,7 @@ async fn winner_count_validation() {
     let r = rpc
         .create_and_send_transaction(
             &[create_auction_ix(
-                &payer, &creator, config_pda, a1, v1, mint, 1, MIN_BID, 10,
+                &payer, &creator, creator_token, config_pda, a1, v1, mint, 1, MIN_BID, 10,
             )],
             &payer.pubkey(),
             &[&payer, &creator],

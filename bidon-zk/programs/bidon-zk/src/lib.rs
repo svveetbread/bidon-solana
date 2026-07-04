@@ -43,6 +43,14 @@ pub const BID_SEED: &[u8] = b"bid";
 /// Компаньон-аккаунт антиснайпа (аудит §7): хранит потолок продления. Отдельный аккаунт (как
 /// ListingConfig у Metaplex Auctioneer) — чтобы НЕ менять layout Auction (иначе старые ауки нечитаемы).
 pub const AUCTION_EXT_SEED: &[u8] = b"auction_ext";
+/// GLOBAL deposit vault (schema 3): a single, PRE-EXISTING PDA token account (seeds = [DEPOSIT_VAULT_SEED],
+/// authority = Config PDA) that holds the Σ of every active schema-3 creator anti-spam deposit. It is
+/// deliberately global (not per-auction): a transfer INTO an account created in the SAME tx (an Anchor
+/// `init` per-auction vault) fails Kora relayer validation ("Account not found" when it resolves the
+/// destination on-chain), so the deposit must land in an account that already exists. Conservation is
+/// enforced per-auction instead (each schema-3 auction adds exactly CREATOR_DEPOSIT at create and reclaims
+/// exactly CREATOR_DEPOSIT once — at claim OR at cancel, never both — so no auction can drain another's).
+pub const DEPOSIT_VAULT_SEED: &[u8] = b"deposit_vault";
 pub const MAX_FEE_BPS: u16 = 1000;
 /// Антиснайп: окно перед концом, в котором смена набора победителей продлевает аукцион, и величина
 /// продления (кладём равными). Продлеваем до потолка создателя. 120с = реалистичное время «увидел +
@@ -67,6 +75,17 @@ pub const CLOSE_GRACE_SECS: i64 = 7 * 24 * 60 * 60;
 /// disable the end_time extension and snipe the final slot. Money gates (claim/withdraw) accept both;
 /// only the bid paths enforce the companion for v2. Bump this (never reuse) for future schema changes.
 pub const SCHEMA_VERSION_ANTISNIPE: u8 = 2;
+/// 3 = top-N + MANDATORY anti-snipe companion (as in v2) + a returnable GLOBAL-vault creator anti-spam
+/// deposit pulled at create and refunded once at claim/cancel. Money gates (claim/withdraw) accept 1|2|3;
+/// only schema-3 auctions move the deposit. Bump this (never reuse) for future schema changes.
+pub const SCHEMA_VERSION_DEPOSIT: u8 = 3;
+/// Creator anti-spam deposit: 0.5 USDC (6 decimals). Pulled from the creator into the GLOBAL deposit vault
+/// at create_auction, refunded in full once — at claim_winnings (a settled auction) OR at cancel_auction
+/// (an empty auction), never both. NEVER change this while schema-3 auctions are live: the amount pulled at
+/// create MUST equal the amount refunded at claim/cancel for the SAME auction, and the global vault holds a
+/// commingled Σ, so a changed constant would let one auction over-refund and drain another's deposit. To
+/// change it, bump to a new schema_version and branch the refund on the auction's stored schema.
+pub const CREATOR_DEPOSIT: u64 = 500_000;
 
 // bidon parimutuel auctions on ZK Compression. Hybrid model:
 //  - Config / Auction / Vault: regular accounts (the hot global leader + the USDC pool).
@@ -103,6 +122,16 @@ pub mod bidon_zk {
         let config = &mut ctx.accounts.config;
         config.fee_bps = fee_bps;
         config.fee_receiver = fee_receiver;
+        Ok(())
+    }
+
+    /// One-time setup of the GLOBAL deposit vault (schema 3). Creates the single PRE-EXISTING PDA token
+    /// account (seeds = [DEPOSIT_VAULT_SEED], authority = Config PDA) that every schema-3 creator deposit
+    /// flows into. All the work is in the account constraints (`init`); the body is empty. Naturally
+    /// one-time — a second call fails because the account already exists. No owner gate is needed: the
+    /// `init` constraints fully pin the PDA, mint, and authority, so anyone (the relayer, `payer`) may
+    /// front the vault rent but cannot create it with any other shape.
+    pub fn init_deposit_vault(_ctx: Context<InitDepositVault>) -> Result<()> {
         Ok(())
     }
 
@@ -158,9 +187,10 @@ pub mod bidon_zk {
         auction.winner_count = winner_count;
         auction.winners = [WinnerSlot::default(); MAX_WINNERS];
         auction.winners_filled = 0;
-        // schema_version = 2: this auction is created WITH an AuctionExt companion (below), so every
-        // subsequent bid is required to supply it (audit N-2). See SCHEMA_VERSION_ANTISNIPE.
-        auction.schema_version = SCHEMA_VERSION_ANTISNIPE;
+        // schema_version = 3: created WITH an AuctionExt companion (mandatory on every bid, audit N-2, as
+        // in v2) AND with a returnable creator anti-spam deposit pulled into the GLOBAL vault below. See
+        // SCHEMA_VERSION_DEPOSIT. antisnipe_cap enforces the companion for schema >= 2 (schema 3 included).
+        auction.schema_version = SCHEMA_VERSION_DEPOSIT;
         let end_time = auction.end_time; // последнее использование auction перед ext (NLL освобождает borrow)
 
         // Компаньон антиснайпа: потолок = конец при создании + заданное создателем макс. продление.
@@ -177,6 +207,19 @@ pub mod bidon_zk {
             .auction_count
             .checked_add(1)
             .ok_or(BidonError::MathOverflow)?;
+
+        // Pull the creator anti-spam deposit into the GLOBAL deposit vault (schema 3). The vault
+        // PRE-EXISTS (init_deposit_vault), so Kora's destination-account check passes. The creator
+        // signs this transfer; it is refunded in full at claim OR cancel (never both). Conservation:
+        // the global vault's balance == CREATOR_DEPOSIT × (active schema-3 auctions).
+        transfer_to_vault(
+            &ctx.accounts.token_program,
+            &ctx.accounts.creator_token,
+            &ctx.accounts.usdc_mint,
+            &ctx.accounts.deposit_vault,
+            &ctx.accounts.creator,
+            CREATOR_DEPOSIT,
+        )?;
         Ok(())
     }
 
@@ -536,10 +579,11 @@ pub mod bidon_zk {
             BidonError::AuctionNotEnded
         );
         require!(!ctx.accounts.auction.creator_paid, BidonError::AlreadyClaimed);
-        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept both the top-N
-        // schema (1) and the anti-snipe schema (2, audit N-2) — a v0 legacy account (0) is rejected.
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept the top-N schema (1),
+        // the anti-snipe schema (2, audit N-2), and the global-vault deposit schema (3) — a v0 legacy
+        // account (0) is rejected.
         require!(
-            matches!(ctx.accounts.auction.schema_version, 1 | 2),
+            matches!(ctx.accounts.auction.schema_version, 1 | 2 | 3),
             BidonError::NotMigrated
         );
 
@@ -601,6 +645,28 @@ pub mod bidon_zk {
             )?;
         }
 
+        // Refund the creator anti-spam deposit (schema 3 only). The deposit lives in the GLOBAL deposit
+        // vault (whose authority is the Config PDA, NOT the auction), so it is signed by the Config PDA
+        // seeds. CONSERVATION: the global vault holds Σ of every ACTIVE schema-3 deposit; each auction
+        // contributes exactly CREATOR_DEPOSIT at create and reclaims exactly CREATOR_DEPOSIT ONCE — here
+        // at claim (gated on !creator_paid, which we set below) OR at cancel (which skips the refund if
+        // creator_paid is already set). Because both paths reclaim exactly CREATOR_DEPOSIT and are mutually
+        // exclusive per auction, no auction can ever over-refund and drain another auction's deposit.
+        if ctx.accounts.auction.schema_version == SCHEMA_VERSION_DEPOSIT {
+            let config_bump = ctx.accounts.config.bump;
+            let dep_signer: &[&[&[u8]]] = &[&[CONFIG_SEED, &[config_bump]]];
+            deposit_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.deposit_vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.creator_token,
+                &ctx.accounts.config.to_account_info(),
+                dep_signer,
+                CREATOR_DEPOSIT,
+                decimals,
+            )?;
+        }
+
         ctx.accounts.auction.creator_paid = true;
         Ok(())
     }
@@ -623,10 +689,12 @@ pub mod bidon_zk {
             now >= ctx.accounts.auction.end_time,
             BidonError::AuctionNotEnded
         );
-        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept both the top-N
-        // schema (1) and the anti-snipe schema (2, audit N-2) — a v0 legacy account (0) is rejected.
+        // Defence-in-depth: a non-migrated legacy account is fail-closed here. Accept the top-N schema (1),
+        // the anti-snipe schema (2, audit N-2), and the global-vault deposit schema (3) — a v0 legacy
+        // account (0) is rejected. withdraw never touches the deposit vault; the deposit is the creator's
+        // and is refunded only in claim/cancel.
         require!(
-            matches!(ctx.accounts.auction.schema_version, 1 | 2),
+            matches!(ctx.accounts.auction.schema_version, 1 | 2 | 3),
             BidonError::NotMigrated
         );
         // Exact mirror of claim: refunds are forbidden to exactly the pids in winners[0..filled].
@@ -746,6 +814,31 @@ pub mod bidon_zk {
             BidonError::AuctionNotEmpty
         );
 
+        // Refund the creator anti-spam deposit (schema 3 only) from the GLOBAL deposit vault, signed by
+        // the Config PDA. The `!creator_paid` guard is the CRITICAL double-refund defense: an empty
+        // schema-3 auction can also be settled via claim_winnings (winners_pot == 0, no payout), which
+        // refunds the deposit and SETS creator_paid. If that already happened, cancel MUST NOT refund
+        // again — the global vault is commingled, so a second refund would pay CREATOR_DEPOSIT out of
+        // ANOTHER auction's deposit (a cross-auction drain). Refund here only when the deposit is still
+        // unclaimed for THIS auction.
+        if ctx.accounts.auction.schema_version == SCHEMA_VERSION_DEPOSIT
+            && !ctx.accounts.auction.creator_paid
+        {
+            let decimals = ctx.accounts.usdc_mint.decimals;
+            let config_bump = ctx.accounts.config.bump;
+            let dep_signer: &[&[&[u8]]] = &[&[CONFIG_SEED, &[config_bump]]];
+            deposit_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.deposit_vault,
+                &ctx.accounts.usdc_mint,
+                &ctx.accounts.creator_token,
+                &ctx.accounts.config.to_account_info(),
+                dep_signer,
+                CREATOR_DEPOSIT,
+                decimals,
+            )?;
+        }
+
         let id_bytes = ctx.accounts.auction.id.to_le_bytes();
         let bump = ctx.accounts.auction.bump;
         let signer_seeds: &[&[&[u8]]] = &[&[AUCTION_SEED, id_bytes.as_ref(), &[bump]]];
@@ -828,6 +921,38 @@ fn vault_transfer<'info>(
                 mint: mint.to_account_info(),
                 to: to.to_account_info(),
                 authority: auction.to_account_info(),
+            },
+            signer_seeds,
+        ),
+        amount,
+        decimals,
+    )
+}
+
+/// Transfer USDC out of the GLOBAL deposit vault, signed by an arbitrary PDA authority (the Config PDA)
+/// via `signer_seeds`. Same transfer_checked core as `vault_transfer`, but the authority is passed as a
+/// raw `AccountInfo` rather than `&Account<Auction>` — the deposit vault's authority is the Config PDA,
+/// not the auction. Kept separate (not merged into vault_transfer) to avoid disturbing the audited
+/// auction-vault transfer path.
+#[allow(clippy::too_many_arguments)]
+fn deposit_transfer<'info>(
+    token_program: &Program<'info, Token>,
+    vault: &Account<'info, TokenAccount>,
+    mint: &Account<'info, Mint>,
+    to: &Account<'info, TokenAccount>,
+    authority: &AccountInfo<'info>,
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+    decimals: u8,
+) -> Result<()> {
+    transfer_checked(
+        CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            TransferChecked {
+                from: vault.to_account_info(),
+                mint: mint.to_account_info(),
+                to: to.to_account_info(),
+                authority: authority.clone(),
             },
             signer_seeds,
         ),
@@ -933,6 +1058,33 @@ pub struct SetConfig<'info> {
     pub owner: Signer<'info>,
 }
 
+/// Accounts for init_deposit_vault (one-time): create the GLOBAL deposit vault PDA token account.
+#[derive(Accounts)]
+pub struct InitDepositVault<'info> {
+    /// Config (read): provides usdc_mint and is the vault authority.
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    /// Platform USDC mint (must equal config.usdc_mint).
+    #[account(address = config.usdc_mint @ BidonError::InvalidMint)]
+    pub usdc_mint: Account<'info, Mint>,
+    /// The GLOBAL deposit vault: a single PDA token account, authority = the Config PDA. `init` makes
+    /// this naturally one-time (a second call fails, the account already exists).
+    #[account(
+        init,
+        payer = payer,
+        seeds = [DEPOSIT_VAULT_SEED],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = config,
+    )]
+    pub deposit_vault: Account<'info, TokenAccount>,
+    /// Relayer — pays the vault rent.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
 #[derive(Accounts)]
 #[instruction(id: u64)]
 pub struct CreateAuction<'info> {
@@ -959,6 +1111,16 @@ pub struct CreateAuction<'info> {
         token::authority = auction,
     )]
     pub vault: Account<'info, TokenAccount>,
+    /// GLOBAL deposit vault (schema 3): PRE-EXISTS (init_deposit_vault). The creator anti-spam deposit is
+    /// pulled INTO it here. Must already exist for Kora's destination-account check to pass.
+    #[account(
+        mut,
+        seeds = [DEPOSIT_VAULT_SEED],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = config,
+    )]
+    pub deposit_vault: Account<'info, TokenAccount>,
     /// Компаньон антиснайпа (§7): хранит потолок продления. Рента с payer (как Auction/vault),
     /// возвращается... остаётся с аукционом (маленький аккаунт, ~ренты). seeds = "auction_ext" + id.
     #[account(
@@ -969,8 +1131,11 @@ pub struct CreateAuction<'info> {
         bump
     )]
     pub auction_ext: Account<'info, AuctionExt>,
-    /// Auction creator — authority (signs), pays NO rent.
+    /// Auction creator — authority (signs), pays NO rent. Also the source of the schema-3 deposit.
     pub creator: Signer<'info>,
+    /// Creator's USDC token account — source of the anti-spam deposit (schema 3). Owned by the creator.
+    #[account(mut, token::mint = usdc_mint, token::authority = creator)]
+    pub creator_token: Account<'info, TokenAccount>,
     /// Rent + tx-fee payer (relayer/gasless). Rent refunded to it on close.
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -1066,6 +1231,16 @@ pub struct ClaimWinnings<'info> {
         token::authority = auction,
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
+    /// GLOBAL deposit vault (schema 3): the creator anti-spam deposit is refunded OUT of it here (signed
+    /// by the Config PDA). authority = config, so seeds pin it to the singleton global vault.
+    #[account(
+        mut,
+        seeds = [DEPOSIT_VAULT_SEED],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = config,
+    )]
+    pub deposit_vault: Box<Account<'info, TokenAccount>>,
     #[account(
         mut,
         constraint = creator_token.owner == auction.creator @ BidonError::Unauthorized,
@@ -1135,9 +1310,13 @@ pub struct CloseAuction<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-/// Accounts for cancel_auction (creator-only, EMPTY auction): close vault + Auction, rent -> relayer.
+/// Accounts for cancel_auction (creator-only, EMPTY auction): refund the schema-3 deposit (if unclaimed),
+/// then close vault + Auction, rent -> relayer.
 #[derive(Accounts)]
 pub struct CancelAuction<'info> {
+    /// Config (read): usdc_mint + the authority that signs the deposit-vault refund.
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
     #[account(
         mut,
         seeds = [AUCTION_SEED, auction.id.to_le_bytes().as_ref()],
@@ -1153,6 +1332,25 @@ pub struct CancelAuction<'info> {
         token::authority = auction,
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
+    /// GLOBAL deposit vault (schema 3): the creator anti-spam deposit is refunded OUT of it here (signed by
+    /// the Config PDA), UNLESS claim already refunded it (creator_paid guard in the handler).
+    #[account(
+        mut,
+        seeds = [DEPOSIT_VAULT_SEED],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = config,
+    )]
+    pub deposit_vault: Box<Account<'info, TokenAccount>>,
+    #[account(address = config.usdc_mint @ BidonError::InvalidMint)]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+    /// Creator's USDC token account — sink for the refunded deposit. Owned by the auction creator.
+    #[account(
+        mut,
+        constraint = creator_token.owner == auction.creator @ BidonError::Unauthorized,
+        constraint = creator_token.mint == config.usdc_mint @ BidonError::InvalidMint,
+    )]
+    pub creator_token: Box<Account<'info, TokenAccount>>,
     /// Auction creator — authority (signs), pays NO rent (0 SOL ok; relayer is the fee-payer).
     pub creator: Signer<'info>,
     /// CHECK: address checked (== auction.rent_payer); receives the vault + Auction rent.
@@ -1315,7 +1513,9 @@ pub struct AuctionExt {
 /// supplying the optional account. Legacy auctions (schema 1, pre-§7) never had a companion, so it
 /// stays optional there and no extension applies (backward compatible).
 fn antisnipe_cap(schema_version: u8, ext_max_end_time: Option<i64>) -> Result<Option<i64>> {
-    if schema_version == SCHEMA_VERSION_ANTISNIPE {
+    // schema >= 2 (anti-snipe v2 AND deposit v3) is created WITH a mandatory companion, so it is required
+    // on every bid; schema 1 (legacy, pre-§7) never had one and stays optional (no extension).
+    if schema_version >= SCHEMA_VERSION_ANTISNIPE {
         Ok(Some(
             ext_max_end_time.ok_or(BidonError::AntisnipeExtRequired)?,
         ))

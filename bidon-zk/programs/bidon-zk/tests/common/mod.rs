@@ -22,7 +22,8 @@ use solana_sdk::{
 
 pub const MIN_BID: u64 = 100_000; // 0.1 USDC (6 decimals)
 
-/// A live environment: Config initialized, USDC mint created, one auction + vault live.
+/// A live environment: Config initialized, USDC mint created, the GLOBAL deposit vault created, one
+/// auction + vault live (the create pulled CREATOR_DEPOSIT from `creator_token` into the deposit vault).
 pub struct Ctx {
     pub payer: Keypair, // relayer: fee payer + rent payer + mint authority
     pub owner: Keypair,
@@ -32,11 +33,44 @@ pub struct Ctx {
     pub auction_pda: Pubkey,
     pub vault_pda: Pubkey,
     pub auction_ext_pda: Pubkey, // §7 антиснайп-компаньон (обязателен на бид-путях, audit N-2)
+    pub deposit_vault_pda: Pubkey, // schema-3 GLOBAL creator-deposit vault (одна на весь env)
+    pub creator_token: Pubkey,   // creator's USDC ATA (funded; source of the schema-3 deposit)
 }
 
 /// Derive the AuctionExt companion PDA (§7): seeds = ["auction_ext", id LE].
 pub fn auction_ext_pda(id: u64) -> Pubkey {
     Pubkey::find_program_address(&[b"auction_ext", &id.to_le_bytes()], &bidon_zk::ID).0
+}
+
+/// Derive the GLOBAL deposit-vault PDA (schema 3): seeds = ["deposit_vault"] (no id — one per program).
+pub fn deposit_vault_pda() -> Pubkey {
+    Pubkey::find_program_address(&[bidon_zk::DEPOSIT_VAULT_SEED], &bidon_zk::ID).0
+}
+
+/// Create the GLOBAL deposit vault (schema 3) — one-time per test env. Idempotent-safe only in the sense
+/// that a second call would fail (init); call exactly once after initialize_config.
+pub async fn init_deposit_vault(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+    config_pda: Pubkey,
+    mint: Pubkey,
+) {
+    let ix = Instruction {
+        program_id: bidon_zk::ID,
+        accounts: bidon_zk::accounts::InitDepositVault {
+            config: config_pda,
+            usdc_mint: mint,
+            deposit_vault: deposit_vault_pda(),
+            payer: payer.pubkey(),
+            token_program: spl_token::ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: bidon_zk::instruction::InitDepositVault {}.data(),
+    };
+    rpc.create_and_send_transaction(&[ix], &payer.pubkey(), &[payer])
+        .await
+        .unwrap();
 }
 
 pub async fn new_rpc() -> LightProgramTest {
@@ -60,15 +94,19 @@ pub async fn setup_n(rpc: &mut LightProgramTest, min_bid: u64, winner_count: u8)
     let mint = create_mint(rpc, &payer).await;
     let (config_pda, _) = Pubkey::find_program_address(&[b"config"], &bidon_zk::ID);
     initialize_config(rpc, &owner, config_pda, mint).await;
+    // GLOBAL deposit vault (schema 3): one per env, created ONCE right after the config.
+    init_deposit_vault(rpc, &payer, config_pda, mint).await;
 
     let creator = Keypair::new();
+    // Fund the creator's USDC ATA well above CREATOR_DEPOSIT so create_auction can pull the deposit.
+    let creator_token = funded_token_account(rpc, &payer, mint, &creator.pubkey(), 10_000_000).await;
     let id = 0u64;
     let (auction_pda, _) =
         Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
     let (vault_pda, _) =
         Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
     create_auction(
-        rpc, &payer, &creator, config_pda, auction_pda, vault_pda, mint, id, min_bid,
+        rpc, &payer, &creator, creator_token, config_pda, auction_pda, vault_pda, mint, id, min_bid,
         winner_count,
     )
     .await;
@@ -82,6 +120,8 @@ pub async fn setup_n(rpc: &mut LightProgramTest, min_bid: u64, winner_count: u8)
         auction_pda,
         vault_pda,
         auction_ext_pda: auction_ext_pda(id),
+        deposit_vault_pda: deposit_vault_pda(),
+        creator_token,
     }
 }
 
@@ -424,6 +464,7 @@ pub async fn create_auction(
     rpc: &mut LightProgramTest,
     payer: &Keypair,
     creator: &Keypair,
+    creator_token: Pubkey,
     config_pda: Pubkey,
     auction_pda: Pubkey,
     vault_pda: Pubkey,
@@ -434,7 +475,8 @@ pub async fn create_auction(
 ) {
     rpc.create_and_send_transaction(
         &[create_auction_ix(
-            payer, creator, config_pda, auction_pda, vault_pda, mint, id, min_bid, winner_count,
+            payer, creator, creator_token, config_pda, auction_pda, vault_pda, mint, id, min_bid,
+            winner_count,
         )],
         &payer.pubkey(),
         &[payer, creator],
@@ -443,11 +485,14 @@ pub async fn create_auction(
     .unwrap();
 }
 
-/// Build the create_auction instruction (so negative tests can assert validation errors).
+/// Build the create_auction instruction (so negative tests can assert validation errors). Pulls
+/// CREATOR_DEPOSIT from `creator_token` into the GLOBAL deposit vault (schema 3), which must already
+/// exist (init_deposit_vault).
 #[allow(clippy::too_many_arguments)]
 pub fn create_auction_ix(
     payer: &Keypair,
     creator: &Keypair,
+    creator_token: Pubkey,
     config_pda: Pubkey,
     auction_pda: Pubkey,
     vault_pda: Pubkey,
@@ -463,8 +508,10 @@ pub fn create_auction_ix(
             auction: auction_pda,
             usdc_mint: mint,
             vault: vault_pda,
-            auction_ext: auction_ext_pda(id), // §7 антиснайп-компаньон (init)
+            deposit_vault: deposit_vault_pda(), // schema-3 GLOBAL deposit vault (pre-exists)
+            auction_ext: auction_ext_pda(id),   // §7 антиснайп-компаньон (init)
             creator: creator.pubkey(),
+            creator_token, // source of the schema-3 deposit
             payer: payer.pubkey(),
             token_program: spl_token::ID,
             system_program: system_program::ID,
@@ -554,6 +601,7 @@ pub async fn do_claim(
             config: ctx.config_pda,
             auction: ctx.auction_pda,
             vault: ctx.vault_pda,
+            deposit_vault: ctx.deposit_vault_pda, // schema-3 deposit refund source
             creator_token,
             fee_receiver_token,
             usdc_mint: ctx.mint,
@@ -643,6 +691,36 @@ pub async fn try_withdraw(
         .map_err(|_| ())
 }
 
+/// cancel_auction (creator-only, EMPTY auction): refund the schema-3 deposit (unless already claimed),
+/// then close vault + Auction. Returns Ok/Err so callers can assert rejections. Creator + relayer co-sign.
+pub async fn try_cancel_auction(rpc: &mut LightProgramTest, ctx: &Ctx) -> std::result::Result<(), ()> {
+    let ix = Instruction {
+        program_id: bidon_zk::ID,
+        accounts: bidon_zk::accounts::CancelAuction {
+            config: ctx.config_pda,
+            auction: ctx.auction_pda,
+            vault: ctx.vault_pda,
+            deposit_vault: ctx.deposit_vault_pda,
+            usdc_mint: ctx.mint,
+            creator_token: ctx.creator_token,
+            creator: ctx.creator.pubkey(),
+            rent_recipient: ctx.payer.pubkey(),
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(None),
+        data: bidon_zk::instruction::CancelAuction {}.data(),
+    };
+    rpc.create_and_send_transaction(&[ix], &ctx.payer.pubkey(), &[&ctx.payer, &ctx.creator])
+        .await
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+/// cancel_auction that must succeed (unwraps).
+pub async fn do_cancel_auction(rpc: &mut LightProgramTest, ctx: &Ctx) {
+    try_cancel_auction(rpc, ctx).await.unwrap();
+}
+
 /// close_auction (permissionless GC): close vault + Auction, rent -> relayer (rent_payer).
 pub async fn do_close_auction(rpc: &mut LightProgramTest, ctx: &Ctx) {
     let ix = Instruction {
@@ -674,13 +752,16 @@ pub async fn create_extra_auction(
     winner_count: u8,
 ) -> Ctx {
     let creator = Keypair::new();
+    // Fund the fresh creator so its schema-3 deposit can be pulled. Reuses the ONE global deposit vault.
+    let creator_token =
+        funded_token_account(rpc, &base.payer, base.mint, &creator.pubkey(), 10_000_000).await;
     let (auction_pda, _) =
         Pubkey::find_program_address(&[b"auction", &id.to_le_bytes()], &bidon_zk::ID);
     let (vault_pda, _) =
         Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
     create_auction(
-        rpc, &base.payer, &creator, base.config_pda, auction_pda, vault_pda, base.mint, id,
-        min_bid, winner_count,
+        rpc, &base.payer, &creator, creator_token, base.config_pda, auction_pda, vault_pda,
+        base.mint, id, min_bid, winner_count,
     )
     .await;
     Ctx {
@@ -692,6 +773,8 @@ pub async fn create_extra_auction(
         auction_pda,
         vault_pda,
         auction_ext_pda: auction_ext_pda(id),
+        deposit_vault_pda: base.deposit_vault_pda,
+        creator_token,
     }
 }
 
