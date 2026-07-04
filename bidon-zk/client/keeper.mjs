@@ -1,21 +1,25 @@
 // keeper.mjs — авто-резолв завершённых аукционов: claim_winnings (победителю) + withdraw (каждому
 // проигравшему) + close_auction. Операции permissionless; релейер подписывает+платит SOL напрямую
-// (без Kora-fee). Бидеры берутся из ленты bidon-store. Идемпотентно: всё в try/catch, ретрай каждый цикл.
+// (без Kora-fee). Бидеры-лузеры берутся ON-CHAIN (Photon getCompressedAccountsByOwner) — НЕ из
+// неаутентифицированной ленты стора (см. #13: убираем последнюю денежную зависимость от стора; лента
+// теперь чисто UI). Идемпотентно: всё в try/catch, ретрай каждый цикл. Nullified (снятые) Bid не
+// возвращаются enumeration'ом → перечисление даёт ровно ОТКРЫТЫЕ ставки (естественная идемпотентность).
 //
 // Запуск: node keeper.mjs [--once]   (--once = один проход и выход, для теста)
 // Render: Web Service (Node), rootDir bidon-zk/client, startCommand `node keeper.mjs`.
-//   Секреты: KORA_PRIVATE_KEY (base58 релейер), STORE_URL, HELIUS_RPC (для withdraw-proof).
+//   Секреты: KORA_PRIVATE_KEY (base58 релейер), STORE_URL, HELIUS_RPC (для withdraw-proof + enumeration).
 import './load-env.mjs';
+import BN from 'bn.js';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { createPrivateKey, sign as edSign } from 'crypto';
 import {
-  RPC_URL, HELIUS_RPC, configPda, auctionPda, vaultPda,
+  RPC_URL, HELIUS_RPC, PROGRAM_ID, configPda, auctionPda, vaultPda,
   ixClaimWinnings, ixCloseAuction, decodeConfig, decodeAuction,
   loadKeypair, connection, sendIx, cuLimit,
 } from './lib.mjs';
-import { lightRpc, buildWithdraw } from './light.mjs';
+import { lightRpc, buildWithdraw, bidAddress, decodeBid } from './light.mjs';
 
 const STORE_URL = process.env.STORE_URL || 'http://127.0.0.1:8091';
 const INTERVAL_MS = Number(process.env.KEEPER_INTERVAL_MS || 60_000);
@@ -77,27 +81,73 @@ const markDone = (id) => {
   void markResolvedInStore(id);
 };
 
-/** Уникальные (proposalId, bidder) ставки аукциона из персистентной ленты стора. */
-async function feedBidders(auctionId) {
-  try {
-    const r = await fetch(`${STORE_URL}/feed?auctionId=${auctionId}`);
-    if (!r.ok) return [];
-    const feed = await r.json();
-    const seen = new Set(), out = [];
-    for (const e of feed) {
-      if (!e || !e.proposalId || !e.bidder) continue;
-      const k = `${e.proposalId}:${e.bidder}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push({ pid: BigInt(e.proposalId), bidder: e.bidder });
-    }
-    return out;
-  } catch {
-    return [];
-  }
+// item.address приходит в разных формах (Uint8Array/Buffer/BN/PublicKey/number[]) — нормализуем
+// к 32-байтному Buffer для сравнения с re-derived bidAddress. Иначе кросс-типовое сравнение молча врёт.
+function toBuf32(v) {
+  if (v == null) return null;
+  if (Buffer.isBuffer(v)) return v.length === 32 ? v : null;
+  if (v instanceof Uint8Array) return v.length === 32 ? Buffer.from(v) : null;
+  if (v instanceof PublicKey) return Buffer.from(v.toBytes());
+  if (v instanceof BN) { const b = v.toArrayLike(Buffer, 'be', 32); return b.length === 32 ? b : null; }
+  if (Array.isArray(v)) return v.length === 32 ? Buffer.from(v) : null;
+  if (typeof v?.toBytes === 'function') { const b = Buffer.from(v.toBytes()); return b.length === 32 ? b : null; }
+  return null;
 }
 
-async function resolveAuction(cfg, a) {
+// addressTree константен — кэшируем один раз (используется в re-derive bidAddress для каждой ставки).
+let _addressTree = null;
+async function addressTree(rpc) {
+  if (!_addressTree) _addressTree = (await rpc.getAddressTreeInfoV2()).tree;
+  return _addressTree;
+}
+
+/**
+ * Перечислить ВСЕ открытые (не-nullified) Bid-аккаунты программы ON-CHAIN через Photon.
+ * getCompressedAccountsByOwner возвращает { items, cursor }; листаем по курсору до конца.
+ * Оставляем только 48-байтовые data (Bid; 72=ProposalTotal, 0=прочее — скип), декодим decodeBid.
+ * Бросает при сбое RPC → вызывающий трактует как transient (ретрай в след. тик, НЕ помечаем done).
+ */
+async function fetchProgramBids(rpc) {
+  const out = [];
+  let cursor;
+  do {
+    const page = await rpc.getCompressedAccountsByOwner(PROGRAM_ID, { cursor });
+    const items = page?.items || [];
+    for (const it of items) {
+      const raw = it?.data?.data;
+      if (!raw || raw.length !== 48) continue; // 48 = Bid; остальное (72=ProposalTotal, 0=прочее) — не наш случай
+      const addr = toBuf32(it.address);
+      if (!addr) continue; // адрес неожиданной формы/длины — пропускаем (не денежная потеря: withdraw permissionless)
+      const bid = decodeBid(Buffer.from(raw));
+      out.push({ address: addr, bidder: bid.bidder, pid: bid.proposal, amount: bid.amount });
+    }
+    cursor = page?.cursor ?? null; // null/undefined → страниц больше нет
+  } while (cursor);
+  return out;
+}
+
+/**
+ * Уникальные (pid, bidder) ОТКРЫТЫЕ ставки конкретного аукциона — из предзагруженного allBids.
+ * Bid принадлежит аукциону id, если re-derived bidAddress(tree, auctionPda(id), pid, bidder) совпадает
+ * с адресом компресс-аккаунта (адрес встраивает auction+pid+bidder). Дедуп по `pid:bidder`.
+ */
+async function chainBidders(rpc, auctionId, allBids) {
+  const tree = await addressTree(rpc);
+  const auction = auctionPda(auctionId);
+  const seen = new Set(), out = [];
+  for (const b of allBids) {
+    const derived = bidAddress(tree, auction, b.pid, b.bidder); // PublicKey
+    if (!Buffer.from(derived.toBytes()).equals(b.address)) continue; // чужой аукцион
+    const bidderB58 = b.bidder.toBase58();
+    const k = `${b.pid}:${bidderB58}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ pid: b.pid, bidder: bidderB58 });
+  }
+  return out;
+}
+
+async function resolveAuction(cfg, a, allBids) {
   const id = a.id;
   const auction = auctionPda(id);
   const vault = vaultPda(auction);
@@ -126,10 +176,12 @@ async function resolveAuction(cfg, a) {
     }
   }
 
-  // 2) возврат каждому проигравшему (бидеры из ленты)
-  const bidders = await feedBidders(id.toString());
+  // 2) возврат каждому проигравшему. Бидеры ON-CHAIN (Photon enumeration) — НЕ из ленты стора (#13):
+  //    allBids уже перечислены в tick() ОДИН раз за проход; здесь фильтруем ставки этого аукциона.
+  //    Nullified (уже снятые) Bid не возвращаются enumeration'ом → это ровно ещё-открытые ставки.
+  const bidders = await chainBidders(lrpc, id, allBids);
   let allRefunded = true;
-  let attempted = 0; // сколько лузеров реально пытались вернуть (для различения «feed пуст» vs «есть остаток»)
+  let attempted = 0; // сколько лузеров реально пытались вернуть (для сверки с он-чейн-остатком волта)
   for (const { pid, bidder } of bidders) {
     if (winnerPids.has(pid.toString())) continue; // победный лот — не возвращаем (ушёл автору)
     attempted++;
@@ -161,21 +213,27 @@ async function resolveAuction(cfg, a) {
     }
   }
 
-  // он-чейн-сверка перед done (H4/M2 аудита): пока в волте лежит USDC — расчёты НЕ закончены, не верим
-  // только feed'у. Различаем сбой стора (feed дал 0 лузеров, а деньги есть → ретрай) и реальный остаток
-  // (лузеры не из feed → логируем и закрываем, иначе крутили бы впустую; они заберут сами, permissionless).
+  // он-чейн-сверка перед done (H4/M2 аудита): пока в волте лежит USDC — расчёты НЕ закончены.
+  // Schema 3: per-auction vault после расчёта держит ТОЛЬКО невыведенные ставки ЛУЗЕРОВ (депозит
+  // создателя — в отдельном GLOBAL deposit vault, победный пул ушёл на claim). Источник лузеров теперь
+  // сам чейн (authoritative), не feed → attempted==0 при vault>0 НЕ означает сбой стора:
+  //   • перечислимые лузеры ещё остались (chainBidders дал >0, но withdraw был transient) → ретрай;
+  //   • либо лузеры без ATA — withdraw упал (ATA нет), эти заберут сами (permissionless) → warn + done.
   let vaultRemaining = -1n;
   try {
     vaultRemaining = BigInt((await conn.getTokenAccountBalance(vault)).value.amount);
   } catch (e) {
     if (isTransient(e.message)) return { done: false }; // не смогли проверить баланс → перепроверим в след. тик
   }
-  if (vaultRemaining > 0n && attempted === 0) {
-    console.log(`[#${id}] vault=${vaultRemaining}, но feed дал 0 лузеров → ретрай (возможен сбой стора)`);
-    return { done: false };
-  }
   if (vaultRemaining > 0n) {
-    console.warn(`[#${id}] ⚠ остаток ${vaultRemaining} в волте после возвратов — лузеры не из feed; заберут сами (withdraw permissionless)`);
+    // Пока chainBidders перечисляет ещё-открытые ставки (allRefunded=false от transient или просто есть
+    // enumerable-лузеры на след. тик) — НЕ помечаем done: чейн говорит, что легит-лузеры ещё есть.
+    if (bidders.some((x) => !winnerPids.has(x.pid.toString()))) {
+      if (allRefunded) console.log(`[#${id}] vault=${vaultRemaining}, лузеры ещё перечислимы он-чейн → ретрай`);
+    } else {
+      // Перечислимых лузеров этого аукциона нет, а деньги есть → остаток у лузеров без ATA (withdraw не прошёл).
+      console.warn(`[#${id}] ⚠ остаток ${vaultRemaining} в волте — лузеры без ATA; заберут сами (withdraw permissionless)`);
+    }
   }
 
   // готов = победителю выплачено, легит-возвраты прошли, и vault проверен он-чейн → больше не трогаем
@@ -190,6 +248,8 @@ async function tick() {
     const now = Math.floor(Date.now() / 1000);
     const count = Number(cfg.auctionCount);
     let processed = 0, active = 0;
+    // Пасс 1: отбираем завершённые аукционы к резолву (дешёвые getAccountInfo, как раньше).
+    const toResolve = [];
     for (let id = 0; id < count; id++) {
       if (doneAuctions.has(id)) continue; // уже отрезолвлен → ни одного RPC
       const info = await conn.getAccountInfo(auctionPda(BigInt(id)));
@@ -197,9 +257,23 @@ async function tick() {
       const a = decodeAuction(info.data);
       if (Number(a.endTime) > now) { active++; continue; } // ещё идёт — перепроверим в след. тик
       if (a.schemaVersion < 1 || a.schemaVersion > 3) { markDone(id); continue; } // legacy v0 (заморожен) → done; 1=топ-N, 2=антиснайп (N-2), 3=депозит
-      const { done } = await resolveAuction(cfg, a);
-      processed++;
-      if (done) markDone(id);
+      toResolve.push(a);
+    }
+    // Пасс 2: если есть что резолвить — ОДИН раз перечисляем все Bid-аккаунты программы он-чейн
+    // (не пере-сканируем per-auction). Сбой enumeration = transient → пропускаем тик, ничего не мечаем done.
+    if (toResolve.length) {
+      let allBids;
+      try {
+        allBids = await fetchProgramBids(lrpc);
+      } catch (e) {
+        console.error(`enumeration Bid'ов упала (${e.message}) → ретрай в след. тик`);
+        return; // не резолвим без списка лузеров — иначе ложно пометили бы done
+      }
+      for (const a of toResolve) {
+        const { done } = await resolveAuction(cfg, a, allBids);
+        processed++;
+        if (done) markDone(a.id);
+      }
     }
     console.log(`tick: к-резолву ${processed}, активных ${active}, пропущено ${doneAuctions.size}/${count}`);
   } catch (e) {
