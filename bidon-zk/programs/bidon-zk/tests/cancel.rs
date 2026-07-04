@@ -21,15 +21,12 @@ fn anchor_code(e: BidonError) -> u32 {
 }
 
 /// Build a cancel_auction instruction (creator-only). fee-payer/relayer signs at send time.
-/// `creator_token` receives the refunded deposit (+ any dust) before the vault closes (schema 3).
-fn cancel_ix(ctx: &Ctx, creator: Pubkey, creator_token: Pubkey, rent_recipient: Pubkey) -> Instruction {
+fn cancel_ix(ctx: &Ctx, creator: Pubkey, rent_recipient: Pubkey) -> Instruction {
     Instruction {
         program_id: bidon_zk::ID,
         accounts: bidon_zk::accounts::CancelAuction {
             auction: ctx.auction_pda,
             vault: ctx.vault_pda,
-            usdc_mint: ctx.mint,
-            creator_token,
             creator,
             rent_recipient,
             token_program: spl_token::ID,
@@ -58,15 +55,8 @@ async fn test_cancel_auction_happy() {
     let mut rpc = new_rpc().await;
     let ctx = setup(&mut rpc, MIN_BID).await;
 
-    // Vault holds only the refundable deposit before cancel (schema 3).
-    assert_eq!(
-        token_amount(&mut rpc, ctx.vault_pda).await,
-        bidon_zk::CREATOR_DEPOSIT,
-        "vault holds the deposit pre-cancel"
-    );
-
     let rent_before = rpc.get_balance(&ctx.payer.pubkey()).await.unwrap();
-    let ix = cancel_ix(&ctx, ctx.creator.pubkey(), ctx.creator_token, ctx.payer.pubkey());
+    let ix = cancel_ix(&ctx, ctx.creator.pubkey(), ctx.payer.pubkey());
     rpc.create_and_send_transaction(&[ix], &ctx.payer.pubkey(), &[&ctx.payer, &ctx.creator])
         .await
         .unwrap();
@@ -78,12 +68,6 @@ async fn test_cancel_auction_happy() {
     assert!(
         rpc.get_account(ctx.auction_pda).await.unwrap().is_none(),
         "Auction closed"
-    );
-    // Deposit was refunded to the creator (10.0 funded → still 10.0 after 0.5 out at create + 0.5 back).
-    assert_eq!(
-        token_amount(&mut rpc, ctx.creator_token).await,
-        10_000_000,
-        "creator got the deposit back"
     );
     assert!(
         rpc.get_balance(&ctx.payer.pubkey()).await.unwrap() > rent_before,
@@ -100,7 +84,7 @@ async fn test_cancel_rejects_non_empty() {
     let (bidder, bidder_token) = funded_bidder(&mut rpc, &ctx, 1_000_000).await;
     do_place_bid(&mut rpc, &ctx, &bidder, bidder_token, 0, CONTENT, 1_000_000).await;
 
-    let ix = cancel_ix(&ctx, ctx.creator.pubkey(), ctx.creator_token, ctx.payer.pubkey());
+    let ix = cancel_ix(&ctx, ctx.creator.pubkey(), ctx.payer.pubkey());
     let res = rpc
         .create_and_send_transaction(&[ix], &ctx.payer.pubkey(), &[&ctx.payer, &ctx.creator])
         .await;
@@ -119,7 +103,7 @@ async fn test_cancel_rejects_non_creator() {
     let ctx = setup(&mut rpc, MIN_BID).await;
 
     let intruder = Keypair::new();
-    let ix = cancel_ix(&ctx, intruder.pubkey(), ctx.creator_token, ctx.payer.pubkey());
+    let ix = cancel_ix(&ctx, intruder.pubkey(), ctx.payer.pubkey());
     let res = rpc
         .create_and_send_transaction(&[ix], &ctx.payer.pubkey(), &[&ctx.payer, &intruder])
         .await;

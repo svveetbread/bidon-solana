@@ -26,14 +26,10 @@ async fn test_claim_winnings() {
     warp_past(&mut rpc, 3601);
     do_claim(&mut rpc, &ctx, creator_token, fee_receiver_token).await;
 
-    // fee = 1.0 * 370 / 10000 = 0.037; payout = 0.963. Creator also gets the 0.5 deposit back.
+    // fee = 1.0 * 370 / 10000 = 0.037; payout = 0.963.
     let fee = amount * 370 / 10_000;
-    assert_eq!(
-        token_amount(&mut rpc, creator_token).await,
-        amount - fee + bidon_zk::CREATOR_DEPOSIT
-    );
+    assert_eq!(token_amount(&mut rpc, creator_token).await, amount - fee);
     assert_eq!(token_amount(&mut rpc, fee_receiver_token).await, fee);
-    // Vault drained: winners_pot (payout+fee) + deposit all left, nothing stranded.
     assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 0);
     assert!(get_auction(&mut rpc, ctx.auction_pda).await.creator_paid);
 }

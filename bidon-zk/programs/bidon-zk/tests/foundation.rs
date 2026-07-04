@@ -108,44 +108,6 @@ async fn test_foundation() {
         Pubkey::find_program_address(&[b"vault", auction_pda.as_ref()], &bidon_zk::ID);
     let (auction_ext_pda, _) =
         Pubkey::find_program_address(&[b"auction_ext", &id.to_le_bytes()], &bidon_zk::ID); // §7 компаньон
-
-    // Fund the creator's USDC ATA so create_auction can pull the refundable deposit (schema 3).
-    let creator_token = {
-        let acc = Keypair::new();
-        let rent = rpc.get_minimum_balance_for_rent_exemption(165).await.unwrap();
-        let create = system_instruction::create_account(
-            &payer.pubkey(),
-            &acc.pubkey(),
-            rent,
-            165,
-            &spl_token::ID,
-        );
-        let init = spl_token::instruction::initialize_account3(
-            &spl_token::ID,
-            &acc.pubkey(),
-            &mint.pubkey(),
-            &creator.pubkey(),
-        )
-        .unwrap();
-        let mint_to = spl_token::instruction::mint_to(
-            &spl_token::ID,
-            &mint.pubkey(),
-            &acc.pubkey(),
-            &payer.pubkey(),
-            &[],
-            10_000_000,
-        )
-        .unwrap();
-        rpc.create_and_send_transaction(
-            &[create, init, mint_to],
-            &payer.pubkey(),
-            &[&payer, &acc],
-        )
-        .await
-        .unwrap();
-        acc.pubkey()
-    };
-
     let ix = Instruction {
         program_id: bidon_zk::ID,
         accounts: bidon_zk::accounts::CreateAuction {
@@ -155,7 +117,6 @@ async fn test_foundation() {
             vault: vault_pda,
             auction_ext: auction_ext_pda,
             creator: creator.pubkey(),
-            creator_token,
             payer: payer.pubkey(),
             token_program: spl_token::ID,
             system_program: system_program::ID,
@@ -182,23 +143,6 @@ async fn test_foundation() {
     assert_eq!(auction.winner_amount, 0);
     assert_eq!(auction.rent_payer, payer.pubkey()); // relayer gets rent back on close
     assert!(!auction.creator_paid);
-    assert_eq!(auction.schema_version, 3); // top-N + anti-snipe + creator deposit
-
-    // The refundable deposit was pulled from the creator into the vault at create (schema 3).
-    let vault_amt = {
-        let acc = rpc.get_account(vault_pda).await.unwrap().unwrap();
-        u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
-    };
-    assert_eq!(vault_amt, bidon_zk::CREATOR_DEPOSIT, "vault holds the deposit");
-    let creator_bal = {
-        let acc = rpc.get_account(creator_token).await.unwrap().unwrap();
-        u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
-    };
-    assert_eq!(
-        creator_bal,
-        10_000_000 - bidon_zk::CREATOR_DEPOSIT,
-        "creator paid the deposit"
-    );
 
     // creator stayed accountless = 0 SOL (gasless), relayer paid all rent.
     assert!(

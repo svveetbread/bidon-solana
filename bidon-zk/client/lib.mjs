@@ -7,7 +7,7 @@ import {
   Connection, Keypair, PublicKey, Transaction, TransactionInstruction,
   SystemProgram, sendAndConfirmTransaction, ComputeBudgetProgram,
 } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
 // ---- constants ----
 export const PROGRAM_ID = new PublicKey('4Pfc1jdDXX4EMFoe7FxNGMfQmSgZSegJn7DCHkxbnfXz');
@@ -24,11 +24,6 @@ export const HELIUS_RPC = process.env.HELIUS_RPC ||
 const CONFIG_SEED = Buffer.from('config');
 const AUCTION_SEED = Buffer.from('auction');
 const VAULT_SEED = Buffer.from('vault');
-const AUCTION_EXT_SEED = Buffer.from('auction_ext'); // компаньон антиснайпа (§7)
-
-// Возвратный анти-спам-депозит создателя (schema_version 3): create_auction тянет ровно эту сумму из
-// USDC-аккаунта создателя в vault и возвращает при claim/cancel. Зеркалит lib.rs CREATOR_DEPOSIT.
-export const CREATOR_DEPOSIT = 500_000n; // 0.5 USDC (6 знаков)
 
 // ---- anchor discriminator ----
 export function disc(name) {
@@ -53,8 +48,6 @@ export const bytes32 = (arr) => {
 export const configPda = () => PublicKey.findProgramAddressSync([CONFIG_SEED], PROGRAM_ID)[0];
 export const auctionPda = (id) =>
   PublicKey.findProgramAddressSync([AUCTION_SEED, u64(id)], PROGRAM_ID)[0];
-export const auctionExtPda = (id) =>
-  PublicKey.findProgramAddressSync([AUCTION_EXT_SEED, u64(id)], PROGRAM_ID)[0];
 export const vaultPda = (auction) =>
   PublicKey.findProgramAddressSync([VAULT_SEED, auction.toBuffer()], PROGRAM_ID)[0];
 
@@ -85,22 +78,12 @@ export function ixSetConfig({ owner, feeBps, feeReceiver }) {
   });
 }
 
-// create_auction(id: u64, min_bid: u64, duration_secs: i64, winner_count: u8, max_extension_secs: i64)
-// Аккаунты (schema 3): config, auction, usdc_mint, vault, auction_ext, creator, creator_token, payer,
-// token_program, system_program. creatorToken — USDC-ATA создателя (источник возвратного депозита),
-// после creator, перед payer. creatorToken по умолчанию берётся как ATA(creator) если не передан.
-export function ixCreateAuction({
-  id, minBid, durationSecs, winnerCount = 1, maxExtensionSecs = 600,
-  creator, creatorToken, payer, usdcMint,
-}) {
+// create_auction(id: u64, min_bid: u64, duration_secs: i64)
+export function ixCreateAuction({ id, minBid, durationSecs, creator, payer, usdcMint }) {
   const config = configPda();
   const auction = auctionPda(id);
   const vault = vaultPda(auction);
-  const auctionExt = auctionExtPda(id);
-  const ct = creatorToken ?? getAssociatedTokenAddressSync(new PublicKey(usdcMint), new PublicKey(creator));
-  const data = Buffer.concat([
-    disc('create_auction'), u64(id), u64(minBid), i64(durationSecs), u8(winnerCount), i64(maxExtensionSecs),
-  ]);
+  const data = Buffer.concat([disc('create_auction'), u64(id), u64(minBid), i64(durationSecs)]);
   return new TransactionInstruction({
     programId: PROGRAM_ID,
     keys: [
@@ -108,9 +91,7 @@ export function ixCreateAuction({
       m(auction, false, true),
       m(usdcMint, false, false),
       m(vault, false, true),
-      m(auctionExt, false, true), // компаньон антиснайпа (§7), init — после vault, перед creator
       m(creator, true, false),
-      m(ct, false, true), // creator_token: источник депозита — после creator, перед payer (schema 3)
       m(payer, true, true),
       m(TOKEN_PROGRAM_ID, false, false),
       m(SystemProgram.programId, false, false),
@@ -149,30 +130,6 @@ export function ixCloseAuction({ id, rentRecipient }) {
     keys: [
       m(auction, false, true),
       m(vault, false, true),
-      m(rentRecipient, false, true),
-      m(TOKEN_PROGRAM_ID, false, false),
-    ],
-    data,
-  });
-}
-
-// cancel_auction() — создатель отменяет ПУСТОЙ аук (proposal_count==0). Аккаунты (schema 3):
-// auction, vault, usdc_mint, creator_token, creator, rent_recipient, token_program. usdc_mint (ro) +
-// creator_token (w) вставлены после vault, перед creator: контракт возвращает весь vault (депозит)
-// на creator_token перед закрытием. creatorToken по умолчанию = ATA(creator).
-export function ixCancelAuction({ id, usdcMint, creatorToken, creator, rentRecipient }) {
-  const auction = auctionPda(id);
-  const vault = vaultPda(auction);
-  const ct = creatorToken ?? getAssociatedTokenAddressSync(new PublicKey(usdcMint), new PublicKey(creator));
-  const data = disc('cancel_auction');
-  return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      m(auction, false, true),
-      m(vault, false, true),
-      m(usdcMint, false, false), // после vault, перед creator (schema 3)
-      m(ct, false, true), // creator_token: адресат возврата депозита — после usdc_mint, перед creator
-      m(creator, true, false),
       m(rentRecipient, false, true),
       m(TOKEN_PROGRAM_ID, false, false),
     ],

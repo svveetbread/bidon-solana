@@ -41,11 +41,8 @@ disclosure — please report issues via [SECURITY.md](../SECURITY.md)).
   on-chain winners array, so the partition cannot diverge.
 - **Access control.** PDA seeds/bumps are enforced, the USDC mint is pinned on every token path, and
   the permissionless handlers (claim / withdraw / close) cannot redirect funds within an auction.
-- **Economic anti-spam.** Creating an auction locks a small **refundable** USDC deposit from the
-  creator, returned in full at settlement or cancel. It is a bond, not a fee, so mass auction-creation
-  spam ties up the spammer's own capital instead of the relayer's SOL.
 
 ## Testing
 
 The full integration suite passes under `cargo test-sbf` (Light Protocol `program-test`), including a
-regression test for each remediated on-chain finding and for the refundable-deposit flow.
+regression test for each remediated on-chain finding.

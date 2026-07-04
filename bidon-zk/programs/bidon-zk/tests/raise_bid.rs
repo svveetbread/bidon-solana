@@ -28,13 +28,10 @@ async fn test_raise_and_top_up() {
     assert_eq!(bid_state(&mut rpc, a_bid).await.amount, 700_000);
     assert_eq!(proposal_total(&mut rpc, p_addr).await.total, 1_000_000);
 
-    // Leader = proposal 0 @ 1.0; vault holds 1.0 staked + 0.5 creator deposit; total_staked 1.0.
+    // Leader = proposal 0 @ 1.0; vault holds 1.0; total_staked 1.0.
     let auction = get_auction(&mut rpc, ctx.auction_pda).await;
     assert_eq!(auction.winner_proposal, 0);
     assert_eq!(auction.winner_amount, 1_000_000);
     assert_eq!(auction.total_staked, 1_000_000);
-    assert_eq!(
-        token_amount(&mut rpc, ctx.vault_pda).await,
-        1_000_000 + bidon_zk::CREATOR_DEPOSIT
-    );
+    assert_eq!(token_amount(&mut rpc, ctx.vault_pda).await, 1_000_000);
 }
