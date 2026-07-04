@@ -13,6 +13,8 @@ dist/
 
 # ключ relayer для e2e (devnet-only, не в репо)
 .relayer.json
+# отдельный ключ кипера (#9: газ+подпись стора, НЕ Kora-релеер; devnet-only, не в репо)
+.keeper.json
 
 # локальные скретч-скрипты и логи (не в репо)
 disc*.sh

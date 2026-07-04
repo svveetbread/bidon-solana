@@ -1,13 +1,14 @@
 // keeper.mjs — авто-резолв завершённых аукционов: claim_winnings (победителю) + withdraw (каждому
-// проигравшему) + close_auction. Операции permissionless; релейер подписывает+платит SOL напрямую
-// (без Kora-fee). Бидеры-лузеры берутся ON-CHAIN (Photon getCompressedAccountsByOwner) — НЕ из
+// проигравшему) + close_auction. Операции permissionless; кипер СВОИМ ключом (#9, НЕ Kora-релеер)
+// подписывает+платит SOL напрямую (без Kora-fee). Бидеры-лузеры берутся ON-CHAIN (Photon
+// getCompressedAccountsByOwner) — НЕ из
 // неаутентифицированной ленты стора (см. #13: убираем последнюю денежную зависимость от стора; лента
 // теперь чисто UI). Идемпотентно: всё в try/catch, ретрай каждый цикл. Nullified (снятые) Bid не
 // возвращаются enumeration'ом → перечисление даёт ровно ОТКРЫТЫЕ ставки (естественная идемпотентность).
 //
 // Запуск: node keeper.mjs [--once]   (--once = один проход и выход, для теста)
 // Render: Web Service (Node), rootDir bidon-zk/client, startCommand `node keeper.mjs`.
-//   Секреты: KORA_PRIVATE_KEY (base58 релейер), STORE_URL, HELIUS_RPC (для withdraw-proof + enumeration).
+//   Секреты: KEEPER_PRIVATE_KEY (base58 своего ключа кипера, #9), STORE_URL, HELIUS_RPC (withdraw-proof + enumeration).
 import './load-env.mjs';
 import BN from 'bn.js';
 import { Keypair, PublicKey } from '@solana/web3.js';
@@ -25,11 +26,17 @@ const STORE_URL = process.env.STORE_URL || 'http://127.0.0.1:8091';
 const INTERVAL_MS = Number(process.env.KEEPER_INTERVAL_MS || 60_000);
 const ONCE = process.argv.includes('--once');
 
-let relayer;
-if (process.env.KORA_PRIVATE_KEY) {
-  relayer = Keypair.fromSecretKey(bs58.decode(process.env.KORA_PRIVATE_KEY));
+// #9: кипер использует СВОЙ отдельный ключ (газ keeper-tx + ed25519-подпись стора /resolved), НЕ
+// Kora-релеер. Утечка ключа кипера больше НЕ даёт Kora-релеер / upgrade-authority. rent_recipient в
+// close остаётся auction.rent_payer (=релеер), а не ключ кипера (см. resolveAuction). Fallback на
+// KORA_PRIVATE_KEY / .keeper.json — для обратной совместимости / локального прогона.
+let keeper;
+if (process.env.KEEPER_PRIVATE_KEY) {
+  keeper = Keypair.fromSecretKey(bs58.decode(process.env.KEEPER_PRIVATE_KEY));
+} else if (process.env.KORA_PRIVATE_KEY) {
+  keeper = Keypair.fromSecretKey(bs58.decode(process.env.KORA_PRIVATE_KEY));
 } else {
-  relayer = loadKeypair(process.env.RELAYER_KEYPAIR || './.relayer.json');
+  keeper = loadKeypair(process.env.KEEPER_KEYPAIR || './.keeper.json');
 }
 
 const conn = connection();
@@ -60,7 +67,7 @@ async function loadResolved() {
 const PKCS8_ED = Buffer.from("302e020100300506032b657004220420", "hex");
 const signEd = (msgBytes) =>
   edSign(null, Buffer.from(msgBytes), createPrivateKey({
-    key: Buffer.concat([PKCS8_ED, Buffer.from(relayer.secretKey.slice(0, 32))]),
+    key: Buffer.concat([PKCS8_ED, Buffer.from(keeper.secretKey.slice(0, 32))]),
     format: "der",
     type: "pkcs8",
   }));
@@ -151,7 +158,7 @@ async function resolveAuction(cfg, a, allBids) {
   const id = a.id;
   const auction = auctionPda(id);
   const vault = vaultPda(auction);
-  const ctx = { config: configPda(), auction, vault, mint: cfg.usdcMint, payer: relayer };
+  const ctx = { config: configPda(), auction, vault, mint: cfg.usdcMint, payer: keeper };
   const winnerPids = new Set(
     a.winners.slice(0, a.winnersFilled).filter((w) => w.total > 0n).map((w) => w.proposalId.toString()),
   );
@@ -164,9 +171,9 @@ async function resolveAuction(cfg, a, allBids) {
   let paid = a.creatorPaid === true || !hasWinner;
   if (!paid) {
     try {
-      const creatorToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, a.creator)).address;
-      const feeReceiverToken = (await getOrCreateAssociatedTokenAccount(conn, relayer, cfg.usdcMint, cfg.feeReceiver)).address;
-      await sendIx(conn, ixClaimWinnings({ id, vault, creatorToken, feeReceiverToken, usdcMint: cfg.usdcMint }), relayer, [], `claim`);
+      const creatorToken = (await getOrCreateAssociatedTokenAccount(conn, keeper, cfg.usdcMint, a.creator)).address;
+      const feeReceiverToken = (await getOrCreateAssociatedTokenAccount(conn, keeper, cfg.usdcMint, cfg.feeReceiver)).address;
+      await sendIx(conn, ixClaimWinnings({ id, vault, creatorToken, feeReceiverToken, usdcMint: cfg.usdcMint }), keeper, [], `claim`);
       console.log(`[#${id}] ✓ выплата победителю`);
       paid = true;
     } catch (e) {
@@ -194,7 +201,7 @@ async function resolveAuction(cfg, a, allBids) {
       // проходит; для фейка buildWithdraw упадёт на отсутствующем Bid (ATA не создаётся, tx не шлётся).
       const bidderToken = getAssociatedTokenAddressSync(cfg.usdcMint, bidderPk);
       const wd = await buildWithdraw(lrpc, ctx, bidderPk, bidderToken, pid);
-      await sendIx(conn, [cuLimit(400_000), wd.ix], relayer, [], `withdraw`);
+      await sendIx(conn, [cuLimit(400_000), wd.ix], keeper, [], `withdraw`);
       console.log(`[#${id}] ✓ возврат pid${pid} ${bidder.slice(0, 8)}…`);
     } catch (e) {
       if (isTransient(e.message)) allRefunded = false; // ретрай в след. цикле; иначе уже возвращено / Bid нет
@@ -206,7 +213,9 @@ async function resolveAuction(cfg, a, allBids) {
   //    Рента релейера остаётся залочена до close. Включить чистку: KEEPER_CLOSE=true (для прод-масштаба).
   if (process.env.KEEPER_CLOSE === 'true') {
     try {
-      await sendIx(conn, ixCloseAuction({ id, rentRecipient: relayer.publicKey }), relayer, [], `close`);
+      // rent_recipient строго = on-chain auction.rent_payer (=Kora-релеер, платил ренту в create),
+      // а НЕ ключ кипера (#9) — иначе close_auction ревертит (constraint has_one/rent_payer).
+      await sendIx(conn, ixCloseAuction({ id, rentRecipient: a.rentPayer }), keeper, [], `close`);
       console.log(`[#${id}] ✓ закрыт`);
     } catch (e) {
       /* ещё не готов (остались возвраты) — следующий цикл */
@@ -281,7 +290,7 @@ async function tick() {
   }
 }
 
-console.log(`bidon keeper · RPC=${RPC_URL} · store=${STORE_URL} · relayer=${relayer.publicKey.toBase58()} · ${ONCE ? 'once' : `loop ${INTERVAL_MS}ms`}`);
+console.log(`bidon keeper · RPC=${RPC_URL} · store=${STORE_URL} · keeper=${keeper.publicKey.toBase58()} · ${ONCE ? 'once' : `loop ${INTERVAL_MS}ms`}`);
 await loadResolved();
 await tick();
 if (!ONCE) {
