@@ -30,6 +30,9 @@ const SITE_URL = process.env.SITE_URL || 'https://bidon.live';
 // Kora-релеер (публичный ключ, НЕ секрет): следим за его SOL, т.к. на нём весь газлесс create/bid.
 const KORA_PUBKEY = process.env.KORA_PUBKEY ? new PublicKey(process.env.KORA_PUBKEY) : null;
 const LOW_SOL = Number(process.env.LOW_SOL_ALERT || 0.3); // порог алерта низкого баланса (SOL)
+// «✅ рассчитан» по умолчанию ВЫКЛ — самый шумный алерт; созданий + низких балансов достаточно.
+// Включить: KEEPER_ALERT_RESOLVED=true.
+const ALERT_RESOLVED = process.env.KEEPER_ALERT_RESOLVED === 'true';
 
 // #9: кипер использует СВОЙ отдельный ключ (газ keeper-tx + ed25519-подпись стора /resolved), НЕ
 // Kora-релеер. Утечка ключа кипера больше НЕ даёт Kora-релеер / upgrade-authority. rent_recipient в
@@ -89,8 +92,12 @@ async function markResolvedInStore(id) {
   }
 }
 const markDone = (id) => {
-  doneAuctions.add(id);
-  void markResolvedInStore(id);
+  // КРИТ: нормализуем к Number. Пасс-1 сверяет `doneAuctions.has(id)` с Number (loop id), а резолв-цикл
+  // зовёт markDone(a.id) с BigInt (a.id из decodeAuction). В Set `5n !== 5` → без нормализации аукцион не
+  // дедупится, резолвится КАЖДЫЙ тик (лишний RPC + спам «рассчитан»). Number(id) выравнивает оба пути.
+  const n = Number(id);
+  doneAuctions.add(n);
+  void markResolvedInStore(n);
 };
 
 // item.address приходит в разных формах (Uint8Array/Buffer/BN/PublicKey/number[]) — нормализуем
@@ -428,7 +435,7 @@ async function tick() {
         processed++;
         if (done) {
           markDone(a.id);
-          if (now - Number(a.endTime) < 7200) void alertResolved(a); // алерт только про свежие (<2ч), не бэклог
+          if (ALERT_RESOLVED && now - Number(a.endTime) < 7200) void alertResolved(a); // опц. (деф off), только свежие (<2ч)
         }
       }
     }
